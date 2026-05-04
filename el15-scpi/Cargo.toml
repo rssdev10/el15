@@ -1,0 +1,16 @@
+[package]
+name = "el15-scpi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SCPI/LXI server emulating a RIGOL DL3000 Series electronic load on top of an EL15"
+
+[dependencies]
+el15-bt = { path = "../el15-bt" }
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,15 @@
+# systemd user unit for the EL15 SCPI background service.
+#
+# Install with: ./install-service.sh
+[Unit]
+Description=ALIENTEK EL15 SCPI server
+After=bluetooth.target network.target
+
+[Service]
+Type=simple
+ExecStart=@EL15_BIN@ --no-gui --port @PORT@
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

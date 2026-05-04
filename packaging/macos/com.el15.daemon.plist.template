@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent template for the EL15 SCPI background service.
+
+  The installer (install-service.sh) will replace @EL15_BIN@ and @PORT@
+  with concrete values and copy this file into:
+      ~/Library/LaunchAgents/com.el15.daemon.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.el15.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@EL15_BIN@</string>
+        <string>--no-gui</string>
+        <string>--port</string>
+        <string>@PORT@</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/el15.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/el15.err.log</string>
+</dict>
+</plist>

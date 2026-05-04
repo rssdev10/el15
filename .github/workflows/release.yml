@@ -1,0 +1,178 @@
+name: build and release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.platform.label }}-${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - label: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: el15-linux-x86_64.zip
+            binary: el15
+          - label: windows
+            arch: x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: el15-windows-x86_64.zip
+            binary: el15.exe
+          - label: macos
+            arch: x86_64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            archive: el15-macos-x86_64.zip
+            binary: el15
+          - label: macos
+            arch: arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            archive: el15-macos-arm64.zip
+            binary: el15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libgl1-mesa-dev \
+            libudev-dev \
+            libusb-1.0-0-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            pkg-config
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: brew install libusb pkg-config
+
+      - name: Install Windows dependencies (vcpkg libusb)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: vcpkg install libusb:x64-windows-static-md
+
+      - name: Build app
+        run: cargo build --locked --release -p el15-app --target ${{ matrix.platform.target }}
+
+      - name: Build SCPI test binary
+        run: cargo build --locked --release -p scpi-test --target ${{ matrix.platform.target }}
+
+      - name: Stage Linux full archive
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir -p dist/el15
+          cp "target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary }}" dist/el15/
+          cp "target/${{ matrix.platform.target }}/release/scpi-test" dist/el15/
+          cp -R docs dist/el15/docs
+          cp README.md LICENSE dist/el15/
+          cp packaging/linux/README.txt dist/el15/PLATFORM.txt
+          (cd dist && zip -r "${{ matrix.platform.archive }}" el15)
+          shasum -a 256 "dist/${{ matrix.platform.archive }}" | awk '{print $1}' > "dist/${{ matrix.platform.archive }}.sha256"
+
+      - name: Stage macOS full archive (.app + .dmg)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APP_VERSION: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir -p dist
+          ./packaging/macos/create_app_bundle.sh \
+            --release \
+            --dmg \
+            --output-dir dist \
+            --binary-path "target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary }}" \
+            --version "$APP_VERSION"
+          # Wrap CLI tools + app + docs into a single full archive.
+          mkdir -p dist/el15
+          cp "target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary }}" dist/el15/
+          cp "target/${{ matrix.platform.target }}/release/scpi-test" dist/el15/
+          cp -R docs dist/el15/docs
+          cp README.md LICENSE dist/el15/
+          cp packaging/macos/README-unsigned.txt dist/el15/PLATFORM.txt
+          cp -R dist/EL15.app dist/el15/EL15.app
+          ditto -c -k --sequesterRsrc --keepParent dist/el15 "dist/${{ matrix.platform.archive }}"
+          shasum -a 256 "dist/${{ matrix.platform.archive }}" | awk '{print $1}' > "dist/${{ matrix.platform.archive }}.sha256"
+          shasum -a 256 dist/EL15.dmg | awk '{print $1}' > dist/EL15.dmg.sha256
+
+      - name: Stage Windows full archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path dist/el15 | Out-Null
+          Copy-Item "target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary }}" dist/el15/
+          Copy-Item "target/${{ matrix.platform.target }}/release/scpi-test.exe" dist/el15/
+          Copy-Item -Recurse docs dist/el15/docs
+          Copy-Item README.md, LICENSE dist/el15/
+          Copy-Item packaging/windows/README.txt dist/el15/PLATFORM.txt
+          Compress-Archive -Path dist/el15/* -DestinationPath "dist/${{ matrix.platform.archive }}" -Force
+          (Get-FileHash "dist/${{ matrix.platform.archive }}" -Algorithm SHA256).Hash.ToLower() | Set-Content "dist/${{ matrix.platform.archive }}.sha256"
+
+      - name: Release artifacts (non-mac)
+        if: github.event_name == 'release' && runner.os != 'macOS'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ matrix.platform.archive }}
+            dist/${{ matrix.platform.archive }}.sha256
+
+      - name: Release artifacts (mac)
+        if: github.event_name == 'release' && runner.os == 'macOS'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ matrix.platform.archive }}
+            dist/${{ matrix.platform.archive }}.sha256
+            dist/EL15.dmg
+            dist/EL15.dmg.sha256
+
+      - name: Upload workflow_dispatch artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: el15-${{ matrix.platform.label }}-${{ matrix.platform.arch }}
+          path: |
+            dist/${{ matrix.platform.archive }}
+            dist/${{ matrix.platform.archive }}.sha256
+            dist/EL15.dmg
+            dist/EL15.dmg.sha256
+          if-no-files-found: ignore
+          retention-days: 7

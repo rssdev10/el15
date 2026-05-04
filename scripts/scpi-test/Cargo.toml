@@ -1,0 +1,16 @@
+[package]
+name = "scpi-test"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Smoke-test the SCPI server emulating a DL3000 on EL15"
+
+[[bin]]
+name = "scpi-test"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "el15-bt"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Bluetooth LE protocol library for the ALIENTEK EL15 DC electronic load"
+
+[dependencies]
+btleplug.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]

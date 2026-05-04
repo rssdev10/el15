@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+dist/
+*.app/
+*.dmg
+*.iconset/
+icon.icns
+
+# Documentation binaries (PDFs of vendor manuals)
+*.pdf
+
+# Logs / scratch
+*.log
+scratch/
+logs/
+
+prompts/
+
+*.csv
+*.zip

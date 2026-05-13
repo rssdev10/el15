@@ -1207,7 +1207,7 @@ impl AppState {
             }
             ModeKind::DCR => {
                 let temp_card = info_card(&lbl_temperature, &format!("{:.2} °C", st.temperature));
-                let dcr_card = info_card(&lbl_resistance, &format!("{:.1} mΩ", st.dcr_mohm * 1000.0));
+                let dcr_card = info_card(&lbl_resistance, &format!("{:.1} mΩ", st.dcr_mohm));
                 column![runtime_card, temp_card, dcr_card].spacing(6).into()
             }
         }

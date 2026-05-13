@@ -29,6 +29,7 @@ scratch/
 logs/
 
 prompts/
+firmware/
 
 *.csv
 *.zip

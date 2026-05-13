@@ -13,6 +13,7 @@ use tokio_stream::StreamExt;
 use tracing::{info, warn};
 
 use crate::cli::Cli;
+use crate::hid_flash;
 use crate::usb;
 
 pub async fn run(args: Cli) -> Result<()> {
@@ -24,9 +25,25 @@ pub async fn run(args: Cli) -> Result<()> {
         return Ok(());
     }
 
+    if args.dfu_probe {
+        hid_flash::probe_device()?;
+        return Ok(());
+    }
+
     if let Some(fw) = &args.flash {
-        usb::dfu_flash(fw, args.usb_vid, args.usb_pid)
-            .with_context(|| format!("DFU flash {}", fw.display()))?;
+        eprintln!("\rFlashing feature was not tested. Stopping here to avoid potential issues.");
+        return Ok(());
+
+        // Flash via HID (same VID/PID stays in DFU mode; STM32 DFU is not used)
+        hid_flash::hid_flash_with_progress(fw, |progress| {
+            let pct = (progress * 100.0) as u32;
+            if pct % 5 == 0 {
+                eprint!("\rFlashing: {}%  ", pct);
+            }
+            true
+        })
+        .with_context(|| format!("HID flash {}", fw.display()))?;
+        eprintln!("\rFlashing: 100% — done");
         return Ok(());
     }
 

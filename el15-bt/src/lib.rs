@@ -16,6 +16,6 @@ pub use protocol::{
     parse_firmware_version,
 };
 pub use device::{
-    scan_devices, scan_devices_with, Device, DeviceEvent, DeviceInfo, ScanOptions,
+    scan_devices, scan_devices_with, scan_for_device, Device, DeviceEvent, DeviceInfo, ScanOptions,
     EL15_SERVICE_UUID,
 };

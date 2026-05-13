@@ -46,6 +46,13 @@ mkdir -p "$APP_DIR/Contents/Resources"
 cp "$BINARY_PATH" "$APP_DIR/Contents/MacOS/el15"
 chmod +x "$APP_DIR/Contents/MacOS/el15"
 
+# Copy app icon
+ICON_SRC="$PROJECT_ROOT/img/icon_el15.icns"
+if [[ -f "$ICON_SRC" ]]; then
+    cp "$ICON_SRC" "$APP_DIR/Contents/Resources/AppIcon.icns"
+    echo "Icon embedded: AppIcon.icns"
+fi
+
 # Render Info.plist
 sed \
     -e "s|__APP_NAME__|$APP_NAME|g" \

@@ -135,7 +135,20 @@ fn truncate(s: &str, n: usize) -> String {
 ///
 /// The binary is uploaded as raw firmware (no DfuSe wrapper). For full DfuSe
 /// (`.dfu`) support, integrate with the `dfu-libusb` crate.
+#[allow(dead_code)]
 pub fn dfu_flash(firmware: &Path, vid: Option<u16>, pid: Option<u16>) -> Result<()> {
+    dfu_flash_with_progress(firmware, vid, pid, |_| true)
+}
+
+/// Like [`dfu_flash`] but calls `progress_cb(fraction)` after each block.
+/// `fraction` is in `0.0..=1.0`. If the callback returns `false`, the flash
+/// is aborted and `Err("cancelled")` is returned.
+pub fn dfu_flash_with_progress(
+    firmware: &Path,
+    vid: Option<u16>,
+    pid: Option<u16>,
+    mut progress_cb: impl FnMut(f32) -> bool,
+) -> Result<()> {
     let firmware_bytes = std::fs::read(firmware)
         .with_context(|| format!("reading firmware {}", firmware.display()))?;
     info!("loaded firmware: {} bytes", firmware_bytes.len());
@@ -167,11 +180,12 @@ pub fn dfu_flash(firmware: &Path, vid: Option<u16>, pid: Option<u16>) -> Result<
     const DFU_DNLOAD: u8 = 1;
     const DFU_CLRSTATUS: u8 = 4;
     let transfer_size: usize = 1024;
+    let total = firmware_bytes.len();
 
     let mut block_num: u16 = 0;
     let mut sent = 0usize;
-    while sent < firmware_bytes.len() {
-        let end = (sent + transfer_size).min(firmware_bytes.len());
+    while sent < total {
+        let end = (sent + transfer_size).min(total);
         let chunk = &firmware_bytes[sent..end];
         handle
             .write_control(REQ_TYPE_OUT, DFU_DNLOAD, block_num, 0, chunk, timeout)
@@ -179,8 +193,12 @@ pub fn dfu_flash(firmware: &Path, vid: Option<u16>, pid: Option<u16>) -> Result<
         wait_dfu_ready(&handle, timeout)?;
         sent = end;
         block_num = block_num.wrapping_add(1);
+        let fraction = sent as f32 / total as f32;
         if block_num % 16 == 0 {
-            info!("flashed {}/{} bytes", sent, firmware_bytes.len());
+            info!("flashed {}/{} bytes", sent, total);
+        }
+        if !progress_cb(fraction) {
+            anyhow::bail!("flash cancelled by user");
         }
     }
 
@@ -190,7 +208,7 @@ pub fn dfu_flash(firmware: &Path, vid: Option<u16>, pid: Option<u16>) -> Result<
         .ok();
     let _ = wait_dfu_ready(&handle, timeout);
     let _ = handle.write_control(REQ_TYPE_OUT, DFU_CLRSTATUS, 0, 0, &[], timeout);
-    info!("DFU download complete ({} bytes)", firmware_bytes.len());
+    info!("DFU download complete ({} bytes)", total);
     Ok(())
 }
 

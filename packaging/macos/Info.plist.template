@@ -28,5 +28,7 @@
     <string>NSApplication</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>EL15 controller uses Bluetooth to talk to the ALIENTEK EL15 electronic load.</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 </dict>
 </plist>

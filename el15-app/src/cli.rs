@@ -25,6 +25,14 @@ pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
+    /// Verbose BLE exchange logging (device search + communication).
+    #[arg(long, global = true)]
+    pub verbose_ble: bool,
+
+    /// Verbose GUI communication logging.
+    #[arg(long, global = true)]
+    pub verbose_gui: bool,
+
     /// Log all SCPI requests/replies to this file (in addition to stdout).
     #[arg(long, global = true, value_name = "FILE")]
     pub log: Option<PathBuf>,
@@ -54,8 +62,13 @@ pub struct Cli {
     pub list_usb: bool,
 
     /// Flash a firmware image to the device using DFU.
-    #[arg(long, value_name = "FIRMWARE.bin")]
+    #[arg(long, value_name = "FIRMWARE.atk")]
     pub flash: Option<PathBuf>,
+
+    /// Interactive HID probe: scan command bytes and show device responses.
+    /// Put the device in DFU mode (Settings > Others > DFU) first.
+    #[arg(long)]
+    pub dfu_probe: bool,
 
     /// Interactive debug shell: connect to EL15 and send/receive commands.
     #[arg(long)]

@@ -87,7 +87,13 @@ pub struct CapSettings {
     pub timer_enabled: bool,
     pub timer_input: String,
     pub cutoff_input: String,
+    #[serde(default)]
+    pub chemistry: String,
+    #[serde(default = "default_cells")]
+    pub cells: u8,
 }
+
+fn default_cells() -> u8 { 1 }
 
 impl Default for CapSettings {
     fn default() -> Self {
@@ -95,6 +101,8 @@ impl Default for CapSettings {
             timer_enabled: false,
             timer_input: "01:00:00".to_string(),
             cutoff_input: "3.0".to_string(),
+            chemistry: String::new(),
+            cells: 1,
         }
     }
 }

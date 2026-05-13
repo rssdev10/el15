@@ -25,7 +25,7 @@ const VISIBLE_SAMPLES: usize = 600;
 const MARGIN_TOP: f32 = 12.0;
 const MARGIN_BOTTOM: f32 = 20.0;
 const MARGIN_LEFT: f32 = 55.0;
-const MARGIN_RIGHT: f32 = 10.0;
+const MARGIN_RIGHT: f32 = 60.0;
 
 /// Minimum axis ranges to avoid divide-by-zero on flat data.
 const MIN_V_RANGE: f32 = 1.0;
@@ -130,6 +130,9 @@ impl<'a> GraphCanvas<'a> {
 
         draw_grid(frame, MARGIN_LEFT, MARGIN_TOP, graph_w, graph_h);
 
+        // Count how many right-side axes we need to place
+        let mut right_axis_index: usize = 0;
+
         if self.show_voltage {
             let (v_min, v_max) = auto_range(visible.iter().map(|s| s.voltage), MIN_V_RANGE);
             draw_trace(frame, visible, n, MARGIN_LEFT, MARGIN_TOP, graph_w, graph_h, |s| s.voltage, v_min, v_max, COLOR_VOLTAGE, 2.0);
@@ -140,11 +143,21 @@ impl<'a> GraphCanvas<'a> {
             draw_trace(frame, visible, n, MARGIN_LEFT, MARGIN_TOP, graph_w, graph_h, |s| s.current, i_min, i_max, COLOR_CURRENT, 2.0);
             if !self.show_voltage {
                 draw_y_axis(frame, MARGIN_LEFT, MARGIN_TOP, graph_h, i_min, i_max, COLOR_CURRENT);
+            } else {
+                draw_y_axis_right(frame, MARGIN_LEFT + graph_w, MARGIN_TOP, graph_h, i_min, i_max, COLOR_CURRENT, right_axis_index);
+                right_axis_index += 1;
             }
         }
         if self.show_power {
             let (p_min, p_max) = auto_range(visible.iter().map(|s| s.power), MIN_P_RANGE);
             draw_trace(frame, visible, n, MARGIN_LEFT, MARGIN_TOP, graph_w, graph_h, |s| s.power, p_min, p_max, COLOR_POWER, 1.5);
+            if !self.show_voltage && !self.show_current {
+                draw_y_axis(frame, MARGIN_LEFT, MARGIN_TOP, graph_h, p_min, p_max, COLOR_POWER);
+            } else {
+                draw_y_axis_right(frame, MARGIN_LEFT + graph_w, MARGIN_TOP, graph_h, p_min, p_max, COLOR_POWER, right_axis_index);
+                #[allow(unused_assignments)]
+                { right_axis_index += 1; }
+            }
         }
 
         draw_legend(frame, size, self.show_voltage, self.show_current, self.show_power);
@@ -159,7 +172,7 @@ impl<'a> GraphCanvas<'a> {
 
         for (idx, trace) in traces.iter().enumerate() {
             let y_off = idx as f32 * (sub_h + SUB_GAP);
-            let graph_w = (size.width - MARGIN_LEFT - MARGIN_RIGHT).max(1.0);
+            let graph_w = (size.width - MARGIN_LEFT - 8.0).max(1.0);
             let inner_h = (sub_h - MARGIN_TOP - MARGIN_BOTTOM).max(1.0);
             let n = visible.len();
 
@@ -302,7 +315,23 @@ fn draw_y_axis(frame: &mut Frame, x_off: f32, y_off: f32, graph_h: f32, min: f32
         let y = y_off + frac * graph_h;
         frame.fill_text(canvas::Text {
             content: format!("{:.2}", val),
-            position: Point::new(x_off - 52.0, y - 6.0),
+            position: Point::new(x_off - 50.0, y - 6.0),
+            color,
+            size: 10.0.into(),
+            ..Default::default()
+        });
+    }
+}
+
+fn draw_y_axis_right(frame: &mut Frame, x_off: f32, y_off: f32, graph_h: f32, min: f32, max: f32, color: Color, index: usize) {
+    let offset = 4.0 + index as f32 * 50.0;
+    for i in 0..=GRID_LINES {
+        let frac = i as f32 / GRID_LINES as f32;
+        let val = max - frac * (max - min);
+        let y = y_off + frac * graph_h;
+        frame.fill_text(canvas::Text {
+            content: format!("{:.2}", val),
+            position: Point::new(x_off + offset, y - 6.0),
             color,
             size: 10.0.into(),
             ..Default::default()

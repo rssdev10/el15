@@ -3,14 +3,21 @@ use std::path::Path;
 use anyhow::Result;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-pub fn init(verbose: u8, log_file: Option<&Path>) -> Result<()> {
-    let default_filter = match verbose {
-        0 => "info,btleplug=warn",
-        1 => "debug,btleplug=info",
-        _ => "trace",
+pub fn init(verbose: u8, log_file: Option<&Path>, verbose_ble: bool, verbose_gui: bool) -> Result<()> {
+    let mut directives = match verbose {
+        0 => "info,btleplug=warn".to_string(),
+        1 => "debug,btleplug=info".to_string(),
+        _ => "trace".to_string(),
     };
+    // Fine-grained verbose control
+    if verbose_ble {
+        directives.push_str(",el15_bt=debug,btleplug=debug");
+    }
+    if verbose_gui {
+        directives.push_str(",el15_app::gui=debug");
+    }
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_filter));
+        .unwrap_or_else(|_| EnvFilter::new(&directives));
 
     let stdout_layer = fmt::layer()
         .with_target(false)

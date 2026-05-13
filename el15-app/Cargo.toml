@@ -39,3 +39,16 @@ rfd.workspace = true
 # USB / DFU
 nusb.workspace = true
 rusb.workspace = true
+hidapi = "2"
+
+# Image loading (for window icon)
+image = { version = "0.24", default-features = false, features = ["png"] }
+
+# Open URLs in browser
+open = "5"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["wincon"] }
+
+[build-dependencies]
+embed-resource = "3"

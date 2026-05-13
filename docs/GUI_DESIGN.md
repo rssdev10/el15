@@ -60,7 +60,7 @@ Right side — three stacked info cells (mode-dependent):
 |------|--------|--------|--------|
 | CC/CV/CR/CP | Run Time | Temp (°C) | **Editable setpoint** |
 | CAP | Run Time | Capacity (Ah) | Energy (Wh) |
-| DCR | Run Time | Temp (°C) | Resistance (Ω) |
+│ DCR | Run Time | Temp (°C) | Resistance (mΩ) |
 
 ### 3. Mode/Output Row
 - Mode buttons: CC, CV, CR, CP, (spacer), CAP, DCR
@@ -74,10 +74,11 @@ Right side — three stacked info cells (mode-dependent):
 Located in the right column, below the info cards. Hidden for CC/CV/CR/CP modes.
 
 **CAP mode (Capacity Test):**
-- Timer enable/disable toggle
-- Timer duration input (HH:MM:SS, range 00:00:01–99:59:59)
-- Cutoff voltage input (range 0.1–60.0 V)
-- Record Clear button
+- Line 1: Timer enable/disable toggle. Duration input (HH:MM:SS) is visible only when timer is enabled, on the same line as the Timer toggle.
+- Line 2: Cutoff voltage input (always visible, range 0.1–60.0 V) + Chemistry type selector (N/A, NiMH/NiCd, NiZn, Li-Ion, LiPo, LiFePO4, Na-Ion) + Cells count combo box (visible only when chemistry is not N/A; allows picking 1–20 from dropdown or typing any value directly).
+- When chemistry is selected, cutoff voltage is auto-calculated as (per-cell voltage × number of cells).
+- Per-cell cutoff voltages: NiMH/NiCd=1.00V, NiZn=1.20V, Li-Ion=3.00V, LiPo=3.00V, LiFePO4=2.50V, Na-Ion=2.00V.
+- Chemistry/cells selections are persisted in settings.
 
 **DCR mode (DC Internal Resistance Test):**
 - I1 current (mA, range 20–12000)
@@ -89,7 +90,8 @@ Located in the right column, below the info cards. Hidden for CC/CV/CR/CP modes.
 - Layout modes: Combined (overlaid), Split ↕ (vertical stacked), Split ↔ (horizontal side-by-side)
 - Chart fills all remaining vertical space in the window; resize by dragging the window border
 - Window size is persisted between sessions (saved in settings)
-- Minimum window size: 600×400 px
+- Minimum window size: 400×400 px
+- Combined mode: voltage scale on left axis, current and power scales on right axis (color-coded)
 - Time mode controls (bottom toolbar row, left-aligned):
   - **Mode toggle button** shows current mode: `⟳ Roll` or `∞ Infinite`; click to switch
   - **Roll mode**: rolling window of the last N seconds; time window input + "Set" button are shown
@@ -130,6 +132,36 @@ Located in the right column, below the info cards. Hidden for CC/CV/CR/CP modes.
 | CV | Set Voltage | V | 0.100–60.000 |
 | CR | Set Resistance | Ω | 0.1–7500.0 |
 | CP | Set Power | W | 0.00–150.00 |
+| CAP | Cutoff V | V | 0.1–60.0 |
+| DCR | Current | mA | 20–12000 |
+
+### Setpoint Validation
+- Out-of-range values are highlighted with a red border around the setpoint block.
+- The "Set" button is disabled when the value is out of range.
+- The Load ON button is also disabled when the setpoint is invalid.
+- The valid range hint is shown in the setpoint label.
+
+## Window Title
+- Shows app name and version from Cargo.toml: "EL15 Electronic Load Controller vX.Y.Z"
+
+## Application Icon
+- Embedded PNG icon (256×256) loaded at startup for Linux/Windows window icon.
+- macOS uses .icns file in the .app bundle (AppIcon.icns).
+- Windows uses embedded .ico resource for taskbar/explorer.
+
+## Settings Page
+- Theme, Language, Poll interval, Auto-connect toggle
+- SCPI Server section: enable/port
+- About section: version display, GitHub repository link (opens browser)
+
+## Disconnection Detection
+- When a BLE poll command fails (device powered off), the app detects disconnection.
+- The DeviceEvent::Disconnected stream event also triggers cleanup.
+- UI resets to disconnected state (clears status, firmware version, device handle).
+
+## Verbose Logging
+- `--verbose-ble`: enables debug logging for BLE device search and communication.
+- `--verbose-gui`: enables debug logging for GUI message processing.
 
 ## Colors
 

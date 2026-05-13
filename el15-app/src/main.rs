@@ -1,7 +1,12 @@
+// On Windows, hide the console window when running in GUI mode.
+// The console is still attached if the app is launched from a terminal.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod cli;
 mod cli_run;
 mod graph;
 mod gui;
+mod hid_flash;
 mod i18n;
 mod logging;
 mod settings;
@@ -15,7 +20,15 @@ use clap::Parser;
 
 fn main() -> anyhow::Result<()> {
     let args = cli::Cli::parse();
-    logging::init(args.verbose, args.log.as_deref())?;
+
+    // On Windows with `windows_subsystem = "windows"`, re-attach to the parent
+    // console when running in CLI mode so output is visible.
+    #[cfg(target_os = "windows")]
+    if args.no_gui || args.list_usb || args.scan || args.flash.is_some() || args.debug {
+        unsafe { winapi::um::wincon::AttachConsole(winapi::um::wincon::ATTACH_PARENT_PROCESS); }
+    }
+
+    logging::init(args.verbose, args.log.as_deref(), args.verbose_ble, args.verbose_gui)?;
 
     if args.no_gui || args.list_usb || args.scan || args.flash.is_some() || args.debug {
         // CLI / headless mode: handle one-shot subcommands or run SCPI server.

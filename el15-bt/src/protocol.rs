@@ -264,8 +264,9 @@ pub fn parse_status_packet(data: &[u8]) -> EL15Status {
             s.dcr_i2 = read_f32_le(&data[19..23]);
             s.dcr_mohm = read_f32_le(&data[23..27]);
             s.runtime_s = 0;
-            s.current = 0.0;
-            s.power = 0.0;
+            // Keep voltage/current/power from bytes 7–15; they reflect the
+            // live measurement during the DCR test.
+            s.power = s.voltage * s.current;
             s.setpoint_in_packet = false;
         }
         Some(Mode::ADV | Mode::POWER | Mode::DT | Mode::PowerRpt) => {

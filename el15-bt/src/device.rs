@@ -101,6 +101,62 @@ pub async fn scan_devices(duration: Option<Duration>) -> Result<Vec<DeviceInfo>>
     .await
 }
 
+/// Scan specifically for a previously-known device by its saved ID string.
+///
+/// Starts BLE scanning and watches advertisement events. Returns as soon as the
+/// target device is seen (early exit), or `None` if the timeout elapses without
+/// finding it. This is much faster than a full 5-second scan when the device is
+/// nearby.
+pub async fn scan_for_device(target_id: &str, timeout: Duration) -> Result<Option<DeviceInfo>> {
+    let manager = Manager::new().await?;
+    let adapters = manager.adapters().await?;
+    let central: Adapter = adapters.into_iter().next().ok_or(Error::NoAdapter)?;
+
+    info!("quick-scan for known device {}", &target_id[..target_id.len().min(12)]);
+
+    let filter = if !cfg!(target_os = "macos") {
+        ScanFilter { services: vec![EL15_SERVICE_UUID] }
+    } else {
+        ScanFilter::default()
+    };
+
+    let mut events = central.events().await?;
+    central.start_scan(filter).await?;
+
+    let target = target_id.to_string();
+    let found = tokio::time::timeout(timeout, async move {
+        while let Some(event) = events.next().await {
+            let id = match &event {
+                CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => id.clone(),
+                _ => continue,
+            };
+            if id.to_string() != target {
+                continue;
+            }
+            if let Ok(p) = central.peripheral(&id).await {
+                let props = p.properties().await.ok().flatten().unwrap_or_default();
+                let name = props.local_name.clone().unwrap_or_default();
+                let addr = props.address.to_string();
+                let _ = central.stop_scan().await;
+                return Some(DeviceInfo {
+                    id: p.id().to_string(),
+                    name: if name.is_empty() { "(unnamed)".into() } else { name },
+                    address: addr,
+                    rssi: props.rssi,
+                    is_el15: true,
+                    peripheral: p,
+                });
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+
+    Ok(found)
+}
+
 pub async fn scan_devices_with(opts: ScanOptions) -> Result<Vec<DeviceInfo>> {
     let manager = Manager::new().await?;
     let adapters = manager.adapters().await?;

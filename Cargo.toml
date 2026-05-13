@@ -8,11 +8,11 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Roman Samarev <samarev@acm.org>"]
 license = "MIT"
-repository = "https://github.com/rss/el15"
+repository = "https://github.com/rssdev10/el15"
 description = "Cross-platform controller for the ALIENTEK EL15 DC electronic load"
 
 [workspace.dependencies]
@@ -55,7 +55,7 @@ rust-i18n = "3"
 sys-locale = "0.3"
 
 # GUI
-iced = { version = "0.13", features = ["tokio", "advanced", "canvas"] }
+iced = { version = "0.13", features = ["tokio", "advanced", "canvas", "image"] }
 
 # Charts
 plotters = "0.3"

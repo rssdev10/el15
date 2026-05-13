@@ -11,13 +11,14 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use iced::widget::{
-    button, column, container, pick_list, row, text, text_input, tooltip, Space,
+    button, column, combo_box, container, pick_list, progress_bar, row, text, text_input, tooltip, Space,
 };
 use iced::widget::canvas::Cache;
 use iced::{Background, Border, Color, Element, Font, Length, Size, Subscription, Task, Theme};
@@ -25,17 +26,17 @@ use iced::font::Family;
 use iced::window;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, info, warn};
 
 use el15_bt::{
-    build_mode_cmd, build_set_setpoint_cmd, scan_devices, Device, DeviceEvent, DeviceInfo,
-    EL15Status, Mode, CMD_LOAD_OFF, CMD_LOAD_ON,
+    build_mode_cmd, build_set_setpoint_cmd, scan_devices, scan_for_device, Device, DeviceEvent,
+    DeviceInfo, EL15Status, Mode, CMD_LOAD_OFF, CMD_LOAD_ON,
 };
 
 use crate::cli::Cli;
 use crate::i18n::{self, t};
 use crate::settings::{self, GraphLayout, GraphTimeMode, ModeKind, Settings, Theme as AppTheme};
-use crate::usb;
 
 const MAX_SAMPLES: usize = 7200;
 
@@ -66,6 +67,11 @@ pub fn run(args: Cli) -> Result<()> {
     i18n::set_language(&settings.language);
     info!("starting GUI; settings={:?}", settings);
 
+    let icon = iced::window::icon::from_file_data(
+        include_bytes!("../../img/icon_el15_256.png"),
+        Some(image::ImageFormat::Png),
+    ).ok();
+
     iced::application(AppState::title, AppState::update, AppState::view)
         .theme(AppState::theme)
         .subscription(AppState::subscription)
@@ -75,7 +81,8 @@ pub fn run(args: Cli) -> Result<()> {
         })
         .window(window::Settings {
             size: Size::new(settings.window_width, settings.window_height),
-            min_size: Some(Size::new(600.0, 400.0)),
+            min_size: Some(Size::new(800.0, 600.0)),
+            icon,
             ..Default::default()
         })
         .run_with(move || AppState::new(args.clone(), settings.clone()))
@@ -90,6 +97,10 @@ pub enum Message {
     Tick,
     Scan,
     ScanResult(Vec<DeviceInfo>),
+    /// Result of a targeted quick-scan for the last known device.
+    /// `Some(info)` = found and should auto-connect; `None` = not found,
+    /// a full scan has been triggered as fallback.
+    QuickScanResult(Option<DeviceInfo>),
     SelectDevice(DeviceChoice),
     Connect,
     Connected(String),
@@ -105,9 +116,13 @@ pub enum Message {
     ChangeLanguage(String),
     OpenSettings,
     CloseSettings,
-    OpenFlashDialog,
+    OpenFlashPage,
+    CloseFlashPage,
+    SelectFirmwareFile,
     StartFlash(PathBuf),
+    FlashProgress(f32),
     FlashDone(Result<(), String>),
+    StopFlash,
     Export,
     ExportDone(Result<PathBuf, String>),
     ChartToggle,
@@ -115,6 +130,8 @@ pub enum Message {
     CapTimerChanged(String),
     CapCutoffChanged(String),
     CapRecordClear,
+    CapChemistryChanged(String),
+    CapCellsChanged(String),
     DcrI1Changed(String),
     DcrI2Changed(String),
     DcrTimerChanged(String),
@@ -133,6 +150,7 @@ pub enum Message {
     ApplyGraphTimeWindow,
     ClearGraph,
     WindowResized(f32, f32),
+    OpenRepo,
     Noop,
 }
 
@@ -177,6 +195,14 @@ pub struct AppState {
     chart_height: f32,
     graph_time_input: String,
     graph_start_time: Option<DateTime<Local>>,
+    cells_combo_state: combo_box::State<String>,
+
+    // ---- flash / DFU page ----
+    show_flash_page: bool,
+    flash_firmware_path: Option<PathBuf>,
+    flash_progress: f32,
+    flash_error: Option<String>,
+    flash_cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl AppState {
@@ -191,7 +217,7 @@ impl AppState {
 
         let s = Self {
             args,
-            settings,
+            settings: settings.clone(),
             devices: vec![],
             selected_device: None,
             device: None,
@@ -208,11 +234,41 @@ impl AppState {
             chart_height: 160.0,
             graph_time_input: time_window_str,
             graph_start_time: None,
+            cells_combo_state: combo_box::State::new((1u8..=20).map(|n| n.to_string()).collect()),
+            show_flash_page: false,
+            flash_firmware_path: None,
+            flash_progress: 0.0,
+            flash_error: None,
+            flash_cancel_flag: None,
         };
-        (s, Task::perform(perform_scan(), Message::ScanResult))
+
+        // If a previously connected device ID is saved, do a quick targeted scan
+        // rather than a full 5-second blind scan. Fallback to full scan if not found.
+        let startup_task = if let Some(known_id) = settings.last_device_id.clone() {
+            Task::perform(
+                async move {
+                    match scan_for_device(&known_id, Duration::from_secs(5)).await {
+                        Ok(Some(info)) => Message::QuickScanResult(Some(info)),
+                        _ => {
+                            // Device not found — run full scan as fallback and
+                            // surface results through the normal ScanResult path.
+                            let devices = perform_scan().await;
+                            Message::ScanResult(devices)
+                        }
+                    }
+                },
+                |m| m,
+            )
+        } else {
+            Task::perform(perform_scan(), Message::ScanResult)
+        };
+
+        (s, startup_task)
     }
 
-    fn title(&self) -> String { t!("app.title").to_string() }
+    fn title(&self) -> String {
+        format!("{} v{}", t!("app.title"), env!("CARGO_PKG_VERSION"))
+    }
 
     fn theme(&self) -> Theme {
         match self.settings.theme {
@@ -227,7 +283,12 @@ impl AppState {
             Message::Tick => {
                 if let Some(dev) = self.device.clone() {
                     return Task::perform(
-                        async move { let _ = dev.poll().await; Message::Noop },
+                        async move {
+                            match dev.poll().await {
+                                Ok(_) => Message::Noop,
+                                Err(_) => Message::Disconnected,
+                            }
+                        },
                         |m| m,
                     );
                 }
@@ -235,6 +296,18 @@ impl AppState {
             Message::Scan => {
                 info!("user requested scan");
                 return Task::perform(perform_scan(), Message::ScanResult);
+            }
+            Message::QuickScanResult(Some(info)) => {
+                info!("quick-scan found known device {}", info.id);
+                let choice = DeviceChoice { id: info.id.clone(), label: info.display_label() };
+                self.selected_device = Some(choice);
+                self.devices = vec![info];
+                if self.settings.auto_connect && self.device.is_none() && !self.connecting {
+                    return self.update(Message::Connect);
+                }
+            }
+            Message::QuickScanResult(None) => {
+                // Fallback handled in the startup task — ScanResult will arrive next.
             }
             Message::ScanResult(list) => {
                 info!("scan -> {} EL15 devices", list.len());
@@ -331,7 +404,9 @@ impl AppState {
             }
             Message::Disconnected => {
                 info!("disconnected");
+                self.device = None;
                 self.last_status = None;
+                self.firmware_version = None;
             }
             Message::DeviceEvent(ev) => match ev {
                 DeviceEvent::Status(st) => {
@@ -472,34 +547,75 @@ impl AppState {
             }
             Message::OpenSettings => { info!("open settings"); self.show_settings = true; }
             Message::CloseSettings => { self.show_settings = false; }
-            Message::OpenFlashDialog => {
+            Message::OpenFlashPage => {
+                self.show_flash_page = true;
+                self.flash_error = None;
+                self.flash_progress = 0.0;
+            }
+            Message::CloseFlashPage => {
+                // Don't close while actively flashing
+                if !self.flashing {
+                    self.show_flash_page = false;
+                }
+            }
+            Message::SelectFirmwareFile => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Firmware", &["bin", "dfu"])
+                    .add_filter("Firmware", &["atk", "bin", "dfu"])
                     .set_title("Choose EL15 firmware image")
                     .pick_file()
                 {
-                    return Task::done(Message::StartFlash(path));
+                    self.flash_firmware_path = Some(path);
+                    self.flash_error = None;
                 }
             }
             Message::StartFlash(path) => {
                 info!("flash firmware {}", path.display());
                 self.flashing = true;
-                return Task::perform(
-                    async move {
-                        match tokio::task::spawn_blocking(move || usb::dfu_flash(&path, None, None)).await {
-                            Ok(Ok(())) => Message::FlashDone(Ok(())),
-                            Ok(Err(e)) => Message::FlashDone(Err(e.to_string())),
-                            Err(e) => Message::FlashDone(Err(e.to_string())),
-                        }
-                    },
-                    |m| m,
+                self.flash_progress = 0.0;
+                self.flash_error = None;
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.flash_cancel_flag = Some(Arc::clone(&cancel));
+
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+                let tx_done = tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::hid_flash::hid_flash_with_progress(&path, |progress| {
+                            let _ = tx.send(Message::FlashProgress(progress));
+                            !cancel.load(Ordering::Relaxed)
+                        })
+                    }).await;
+                    let done = match result {
+                        Ok(Ok(())) => Message::FlashDone(Ok(())),
+                        Ok(Err(e)) => Message::FlashDone(Err(e.to_string())),
+                        Err(e)     => Message::FlashDone(Err(e.to_string())),
+                    };
+                    let _ = tx_done.send(done);
+                });
+                return Task::stream(
+                    UnboundedReceiverStream::new(rx)
                 );
+            }
+            Message::FlashProgress(p) => {
+                self.flash_progress = p;
+            }
+            Message::StopFlash => {
+                if let Some(flag) = &self.flash_cancel_flag {
+                    flag.store(true, Ordering::Relaxed);
+                }
             }
             Message::FlashDone(res) => {
                 self.flashing = false;
+                self.flash_cancel_flag = None;
                 match res {
-                    Ok(()) => info!("flash complete"),
-                    Err(e) => warn!("flash failed: {e}"),
+                    Ok(()) => {
+                        info!("flash complete");
+                        self.flash_progress = 1.0;
+                    }
+                    Err(e) => {
+                        warn!("flash failed: {e}");
+                        self.flash_error = Some(e);
+                    }
                 }
             }
             Message::Export => {
@@ -607,6 +723,9 @@ impl AppState {
             Message::ChartToggle => {
                 self.chart_height = if self.chart_height > 0.0 { 0.0 } else { 160.0 };
             }
+            Message::OpenRepo => {
+                let _ = open::that("https://github.com/rssdev10/el15");
+            }
             Message::CapTimerToggle => {
                 self.settings.cap.timer_enabled = !self.settings.cap.timer_enabled;
                 let _ = settings::save(&self.settings);
@@ -622,6 +741,24 @@ impl AppState {
             Message::CapRecordClear => {
                 self.samples.clear();
                 self.graph_cache.clear();
+            }
+            Message::CapChemistryChanged(v) => {
+                self.settings.cap.chemistry = v.clone();
+                // Update cutoff based on chemistry and cells
+                if let Some(cutoff) = chemistry_cutoff(&v, self.settings.cap.cells) {
+                    self.settings.cap.cutoff_input = format!("{:.2}", cutoff);
+                }
+                let _ = settings::save(&self.settings);
+            }
+            Message::CapCellsChanged(v) => {
+                if let Ok(n) = v.parse::<u8>() {
+                    let n = n.max(1);
+                    self.settings.cap.cells = n;
+                    if let Some(cutoff) = chemistry_cutoff(&self.settings.cap.chemistry, n) {
+                        self.settings.cap.cutoff_input = format!("{:.2}", cutoff);
+                    }
+                    let _ = settings::save(&self.settings);
+                }
             }
             Message::DcrI1Changed(v) => {
                 self.settings.dcr.i1_input = v;
@@ -714,6 +851,7 @@ impl AppState {
     fn view(&self) -> Element<'_, Message> {
         if self.show_settings { return self.view_settings(); }
         if self.show_confirm { return self.view_confirm(); }
+        if self.show_flash_page { return self.view_flash_page(); }
 
         let st = self.last_status.clone().unwrap_or_default();
         let connected = self.device.is_some();
@@ -741,11 +879,6 @@ impl AppState {
         let status_bar = container(
             row![
                 badge(
-                    &load_label,
-                    if st.load_on { COLOR_LOAD_ON } else { COLOR_LOAD_OFF },
-                ),
-                Space::with_width(Length::Fixed(12.0)),
-                badge(
                     &format!("{}: {}", t!("label.bluetooth"), &conn_label),
                     conn_color,
                 ),
@@ -758,6 +891,11 @@ impl AppState {
                 Space::with_width(Length::Fill),
                 indicator(if st.warning.is_empty() && self.last_command_ok { "OK" } else if !st.warning.is_empty() { st.warning.as_str() } else { "ERR" },
                     if st.warning.is_empty() && self.last_command_ok { COLOR_LOAD_ON } else { COLOR_CURRENT }),
+                Space::with_width(Length::Fixed(12.0)),
+                badge(
+                    &load_label,
+                    if st.load_on { COLOR_LOAD_ON } else { COLOR_LOAD_OFF },
+                )
             ]
             .spacing(0)
             .align_y(iced::Alignment::Center),
@@ -806,6 +944,7 @@ impl AppState {
             let on = st.load_on;
             let label = if on { t!("btn.disable_load").to_string() } else { t!("btn.enable_load").to_string() };
             let color = if on { COLOR_LOAD_ON } else { Color::from_rgb(0.85, 0.55, 0.10) };
+            let setpoint_ok = on || is_setpoint_valid(&self.setpoint_input, self.settings.last_mode);
             let mut b = button(text(label).size(14).color(Color::WHITE))
                 .padding([8, 18])
                 .style(move |_, _| iced::widget::button::Style {
@@ -814,22 +953,22 @@ impl AppState {
                     border: Border { color, width: 2.0, radius: 6.0.into() },
                     ..Default::default()
                 });
-            if connected {
+            if connected && setpoint_ok {
                 b = b.on_press(Message::ToggleLoad);
             }
             b
         };
 
-        let output_label = text(format!("{}: {}", t!("label.output"), if st.load_on { t!("btn.load_on") } else { t!("btn.load_off") }))
-            .size(13)
-            .color(if st.load_on { COLOR_LOAD_ON } else { COLOR_LOAD_OFF });
+        // let output_label = text(format!("{}: {}", t!("label.output"), if st.load_on { t!("btn.load_on") } else { t!("btn.load_off") }))
+        //     .size(13)
+        //     .color(if st.load_on { COLOR_LOAD_ON } else { COLOR_LOAD_OFF });
 
         let control_row = container(
             row![
                 mode_buttons,
                 Space::with_width(Length::Fill),
-                output_label,
-                Space::with_width(Length::Fixed(10.0)),
+                // output_label,
+                // Space::with_width(Length::Fixed(10.0)),
                 load_btn,
             ]
             .spacing(6)
@@ -1014,9 +1153,6 @@ impl AppState {
                 conn_status,
                 Space::with_width(Length::Fill),
                 button(text(t!("btn.settings")).size(12)).padding([4, 10]).on_press(Message::OpenSettings),
-                button(text(if self.flashing { t!("btn.flashing") } else { t!("btn.flash") }).size(12))
-                    .padding([4, 10])
-                    .on_press(Message::OpenFlashDialog),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
@@ -1071,14 +1207,15 @@ impl AppState {
             }
             ModeKind::DCR => {
                 let temp_card = info_card(&lbl_temperature, &format!("{:.2} °C", st.temperature));
-                let dcr_card = info_card(&lbl_resistance, &format!("{:.1} Ω", st.dcr_mohm));
+                let dcr_card = info_card(&lbl_resistance, &format!("{:.1} mΩ", st.dcr_mohm * 1000.0));
                 column![runtime_card, temp_card, dcr_card].spacing(6).into()
             }
         }
     }
 
     fn setpoint_editor(&self) -> Element<'_, Message> {
-        let (label, unit, _hint) = match self.settings.last_mode {
+        let mode = self.settings.last_mode;
+        let (label, unit, hint) = match mode {
             ModeKind::CC  => (t!("label.set_current").to_string(),    "A", "0.000–12.000"),
             ModeKind::CV  => (t!("label.set_voltage").to_string(),    "V", "0.100–60.000"),
             ModeKind::CR  => (t!("label.set_resistance").to_string(), "Ω", "0.1–7500.0"),
@@ -1086,9 +1223,17 @@ impl AppState {
             ModeKind::CAP => (t!("label.cutoff_v").to_string(),       "V", "0.1–60.0"),
             ModeKind::DCR => (t!("label.current").to_string(),        "mA", "20–12000"),
         };
+        let valid = is_setpoint_valid(&self.setpoint_input, mode);
+        let border_color = if valid { Color::from_rgb(0.4, 0.4, 0.4) } else { Color::from_rgb(0.9, 0.2, 0.2) };
+
+        let mut set_btn = button(text(t!("btn.set").to_string()).size(12)).padding([4, 10]);
+        if valid {
+            set_btn = set_btn.on_press(Message::ApplySetpoint);
+        }
+
         container(
             column![
-                text(label).size(11),
+                text(format!("{} ({})", label, hint)).size(11),
                 row![
                     text_input("0.0", &self.setpoint_input)
                         .on_input(Message::SetpointChanged)
@@ -1097,7 +1242,7 @@ impl AppState {
                         .size(16),
                     text(unit).size(14),
                     Space::with_width(Length::Fill),
-                    button(text(t!("btn.set").to_string()).size(12)).padding([4, 10]).on_press(Message::ApplySetpoint),
+                    set_btn,
                 ]
                 .spacing(6)
                 .align_y(iced::Alignment::Center),
@@ -1105,7 +1250,10 @@ impl AppState {
             .spacing(2),
         )
         .padding(6)
-        .style(container::bordered_box)
+        .style(move |_| container::Style {
+            border: Border { color: border_color, width: 1.5, radius: 6.0.into() },
+            ..Default::default()
+        })
         .width(Length::Fill)
         .into()
     }
@@ -1115,32 +1263,71 @@ impl AppState {
             ModeKind::CAP => {
                 let timer_btn_label = if self.settings.cap.timer_enabled { t!("btn.disable").to_string() } else { t!("btn.enable").to_string() };
                 let timer_state = if self.settings.cap.timer_enabled { t!("btn.load_on").to_string() } else { t!("btn.load_off").to_string() };
+
+                // Line 1: Timer toggle + Duration (only shown when timer enabled)
+                let mut timer_row = row![
+                    text(format!("{}:", t!("label.timer"))).size(12),
+                    text(timer_state).size(12),
+                    Space::with_width(Length::Fixed(8.0)),
+                    button(text(timer_btn_label).size(11))
+                        .padding([3, 8])
+                        .on_press(Message::CapTimerToggle),
+                ].spacing(6).align_y(iced::Alignment::Center);
+
+                if self.settings.cap.timer_enabled {
+                    timer_row = timer_row.push(Space::with_width(Length::Fixed(16.0)));
+                    timer_row = timer_row.push(text(format!("{}:", t!("label.duration"))).size(12));
+                    timer_row = timer_row.push(
+                        text_input("01:00:00", &self.settings.cap.timer_input)
+                            .on_input(Message::CapTimerChanged)
+                            .width(Length::Fixed(90.0))
+                            .size(13),
+                    );
+                }
+
+                // Line 2: Cutoff V + Chemistry + Cells
+                let chemistry_display = if self.settings.cap.chemistry.is_empty() {
+                    t!("label.na").to_string()
+                } else {
+                    self.settings.cap.chemistry.clone()
+                };
+
+                let has_chemistry = !self.settings.cap.chemistry.is_empty()
+                    && self.settings.cap.chemistry != t!("label.na").to_string();
+
+                let mut cutoff_row = row![
+                    text(format!("{}:", t!("label.cutoff_v"))).size(12),
+                    text_input("3.0", &self.settings.cap.cutoff_input)
+                        .on_input(Message::CapCutoffChanged)
+                        .width(Length::Fixed(60.0))
+                        .size(13),
+                    text("V").size(12),
+                    Space::with_width(Length::Fixed(16.0)),
+                    text(format!("{}:", t!("label.chemistry_type"))).size(12),
+                    pick_list(
+                        chemistry_names(),
+                        Some(chemistry_display),
+                        Message::CapChemistryChanged,
+                    ).text_size(12),
+                ].spacing(6).align_y(iced::Alignment::Center);
+
+                if has_chemistry {
+                    let cells_str = self.settings.cap.cells.to_string();
+                    let cells_selected = Some(&cells_str);
+                    cutoff_row = cutoff_row.push(Space::with_width(Length::Fixed(12.0)));
+                    cutoff_row = cutoff_row.push(
+                        combo_box(&self.cells_combo_state, "#", cells_selected, Message::CapCellsChanged)
+                            .on_input(Message::CapCellsChanged)
+                            .width(Length::Fixed(75.0))
+                            .size(13.0),
+                    );
+                }
+
                 container(
                     column![
                         text(t!("label.cap_params").to_string()).size(13),
-                        row![
-                            text(format!("{}:", t!("label.timer"))).size(12),
-                            text(timer_state).size(12),
-                            Space::with_width(Length::Fixed(8.0)),
-                            button(text(timer_btn_label).size(11))
-                                .padding([3, 8])
-                                .on_press(Message::CapTimerToggle),
-                        ].spacing(6).align_y(iced::Alignment::Center),
-                        row![
-                            text(format!("{}:", t!("label.duration"))).size(12),
-                            text_input("01:00:00", &self.settings.cap.timer_input)
-                                .on_input(Message::CapTimerChanged)
-                                .width(Length::Fixed(90.0))
-                                .size(13),
-                            Space::with_width(Length::Fixed(12.0)),
-                            text(format!("{}:", t!("label.cutoff_v"))).size(12),
-                            text_input("3.0", &self.settings.cap.cutoff_input)
-                                .on_input(Message::CapCutoffChanged)
-                                .width(Length::Fixed(60.0))
-                                .size(13),
-                            text("V").size(12),
-                            Space::with_width(Length::Fill),
-                        ].spacing(6).align_y(iced::Alignment::Center),
+                        timer_row,
+                        cutoff_row,
                     ]
                     .spacing(6),
                 )
@@ -1154,24 +1341,25 @@ impl AppState {
                     column![
                         text(t!("label.dcr_params").to_string()).size(13),
                         row![
-                            text("I1:").size(12),
+                            text("I1: ").size(12),
                             text_input("20", &self.settings.dcr.i1_input)
                                 .on_input(Message::DcrI1Changed)
-                                .width(Length::Fixed(70.0))
+                                .width(Length::Fixed(40.0))
                                 .size(13),
                             text("mA").size(12),
                             Space::with_width(Length::Fixed(12.0)),
-                            text("I2:").size(12),
+                            text("I2: ").size(12),
                             text_input("1000", &self.settings.dcr.i2_input)
                                 .on_input(Message::DcrI2Changed)
-                                .width(Length::Fixed(70.0))
+                                .width(Length::Fixed(60.0))
                                 .size(13),
-                            text("mA").size(12),
-                            Space::with_width(Length::Fixed(12.0)),
+                            text("mA").size(12)
+                        ].align_y(iced::Alignment::Center),
+                        row![
                             text(format!("{}:", t!("label.timer"))).size(12),
                             text_input("2", &self.settings.dcr.timer_input)
                                 .on_input(Message::DcrTimerChanged)
-                                .width(Length::Fixed(40.0))
+                                .width(Length::Fixed(30.0))
                                 .size(13),
                             text("s").size(12),
                         ].spacing(6).align_y(iced::Alignment::Center),
@@ -1217,6 +1405,104 @@ impl AppState {
         .into()
     }
 
+    fn view_flash_page(&self) -> Element<'_, Message> {
+        let instructions = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            t!("flash.step_header"),
+            t!("flash.step_1"),
+            t!("flash.step_2"),
+            t!("flash.step_3"),
+            t!("flash.step_4"),
+            t!("flash.step_5"),
+        );
+
+        let firmware_label = match &self.flash_firmware_path {
+            Some(p) => p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("(unknown)")
+                .to_string(),
+            None => t!("flash.no_file").to_string(),
+        };
+
+        let select_btn = button(text(t!("btn.select_firmware")).size(13))
+            .padding([6, 14])
+            .on_press(Message::SelectFirmwareFile);
+
+        let start_btn = {
+            let b = button(text(t!("btn.start_flash")).size(13)).padding([6, 14]);
+            if self.flashing || self.flash_firmware_path.is_none() {
+                b
+            } else {
+                let path = self.flash_firmware_path.clone().unwrap();
+                b.on_press(Message::StartFlash(path))
+            }
+        };
+
+        let stop_btn = {
+            let b = button(text(t!("btn.stop_flash")).size(13)).padding([6, 14]);
+            if self.flashing {
+                b.on_press(Message::StopFlash)
+            } else {
+                b
+            }
+        };
+
+        let close_btn = {
+            let b = button(text(t!("btn.close")).size(13)).padding([6, 14]);
+            if !self.flashing {
+                b.on_press(Message::CloseFlashPage)
+            } else {
+                b
+            }
+        };
+
+        let status_text: Element<'_, Message> = if self.flashing {
+            text(format!("{} {:.0}%", t!("flash.progress"), self.flash_progress * 100.0)).size(13).into()
+        } else if let Some(err) = &self.flash_error {
+            text(format!("{}: {}", t!("flash.error"), err)).size(13).color(Color::from_rgb(0.85, 0.2, 0.2)).into()
+        } else if self.flash_progress >= 1.0 {
+            text(t!("flash.done").to_string()).size(13).color(COLOR_LOAD_ON).into()
+        } else {
+            Space::with_height(Length::Fixed(0.0)).into()
+        };
+
+        container(
+            column![
+                text(t!("flash.title")).size(20),
+                Space::with_height(Length::Fixed(12.0)),
+                container(text(instructions).size(13))
+                    .padding(12)
+                    .style(container::bordered_box)
+                    .width(Length::Fill),
+                Space::with_height(Length::Fixed(16.0)),
+                row![
+                    select_btn,
+                    Space::with_width(Length::Fixed(10.0)),
+                    text(firmware_label).size(13),
+                ].align_y(iced::Alignment::Center),
+                Space::with_height(Length::Fixed(8.0)),
+                row![
+                    start_btn,
+                    Space::with_width(Length::Fixed(10.0)),
+                    stop_btn,
+                ].spacing(0).align_y(iced::Alignment::Center),
+                Space::with_height(Length::Fixed(12.0)),
+                progress_bar(0.0..=1.0, self.flash_progress)
+                    .height(Length::Fixed(20.0))
+                    .width(Length::Fill),
+                Space::with_height(Length::Fixed(6.0)),
+                status_text,
+                Space::with_height(Length::Fill),
+                close_btn,
+            ]
+            .padding(24)
+            .spacing(0),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
     fn view_settings(&self) -> Element<'_, Message> {
         let theme_pick = pick_list(
             vec![AppTheme::Light, AppTheme::Dark],
@@ -1231,6 +1517,7 @@ impl AppState {
         container(
             column![
                 text(t!("settings.title")).size(22),
+                Space::with_height(Length::Fixed(8.0)),
                 row![text(t!("settings.theme")), theme_pick].spacing(10),
                 row![text(t!("settings.language")), lang_pick].spacing(10),
                 row![text(t!("settings.poll")), text(format!("{} ms", self.settings.poll_interval_ms))].spacing(10),
@@ -1238,13 +1525,33 @@ impl AppState {
                      button(text(if self.settings.auto_connect { "ON" } else { "OFF" }).size(12))
                         .padding([4, 10])
                         .on_press(Message::ToggleAutoConnect)].spacing(10),
+                Space::with_height(Length::Fixed(12.0)),
+                text(t!("settings.scpi_section")).size(16),
                 row![text(t!("settings.scpi.enable")),
                      text(if self.settings.scpi.enabled { "ON" } else { "OFF" })].spacing(10),
                 row![text(t!("settings.scpi.port")), text(self.settings.scpi.port.to_string())].spacing(10),
+                Space::with_height(Length::Fixed(12.0)),
+                text(t!("settings.about_section")).size(16),
+                row![
+                    text(format!("{} v{}", t!("app.title"), env!("CARGO_PKG_VERSION"))).size(13),
+                ].spacing(6),
+                row![
+                    text(t!("settings.repository")).size(13),
+                    button(text("GitHub").size(12)).padding([3, 8]).on_press(Message::OpenRepo),
+                ].spacing(6).align_y(iced::Alignment::Center),
+
+                // Firmware update section 
+                // Space::with_height(Length::Fixed(20.0)),
+                // text(t!("settings.firmware_section")).size(16),
+                // text(t!("settings.firmware_note")).size(12),
+                // Space::with_height(Length::Fixed(4.0)),
+                // button(text(t!("btn.flash")).size(13)).padding([6, 16]).on_press(Message::OpenFlashPage),
+
+                // Close button
                 Space::with_height(Length::Fixed(20.0)),
-                button(text("Close")).on_press(Message::CloseSettings),
+                button(text(t!("btn.close").to_string())).on_press(Message::CloseSettings),
             ]
-            .spacing(12)
+            .spacing(10)
             .padding(20),
         )
         .into()
@@ -1393,15 +1700,31 @@ fn store_setpoint(s: &mut Settings, mode: ModeKind, value: f32) {
 }
 
 fn clamp_setpoint(mode: ModeKind, v: f32) -> f32 {
-    let (lo, hi) = match mode {
+    let (lo, hi) = setpoint_range(mode);
+    v.max(lo).min(hi)
+}
+
+/// Returns (min, max) allowed setpoint for the given mode.
+fn setpoint_range(mode: ModeKind) -> (f32, f32) {
+    match mode {
         ModeKind::CC  => (0.0, 12.0),
         ModeKind::CV  => (0.1, 60.0),
         ModeKind::CR  => (0.1, 7500.0),
         ModeKind::CP  => (0.0, 150.0),
         ModeKind::CAP => (0.1, 60.0),
         ModeKind::DCR => (20.0, 12000.0),
-    };
-    v.max(lo).min(hi)
+    }
+}
+
+/// Check if the current setpoint input is within the valid range.
+fn is_setpoint_valid(input: &str, mode: ModeKind) -> bool {
+    match input.parse::<f32>() {
+        Ok(v) => {
+            let (lo, hi) = setpoint_range(mode);
+            v >= lo && v <= hi
+        }
+        Err(_) => false,
+    }
 }
 
 /// Get the stored setpoint for a mode. Returns None for CAP/DCR (device-managed).
@@ -1420,6 +1743,32 @@ async fn perform_scan() -> Vec<DeviceInfo> {
         Ok(v) => v,
         Err(e) => { warn!("scan failed: {e}"); vec![] }
     }
+}
+
+/// Battery chemistry types with their per-cell cutoff voltages.
+const CHEMISTRY_TYPES: &[(&str, f32)] = &[
+    ("NiMH/NiCd", 1.00),
+    ("NiZn", 1.20),
+    ("Li-Ion", 3.00),
+    ("LiPo", 3.00),
+    ("LiFePO4", 2.50),
+    ("Na-Ion", 2.00),
+];
+
+fn chemistry_names() -> Vec<String> {
+    let mut v = vec![t!("label.na").to_string()];
+    v.extend(CHEMISTRY_TYPES.iter().map(|(name, _)| name.to_string()));
+    v
+}
+
+fn chemistry_cutoff(chem: &str, cells: u8) -> Option<f32> {
+    if chem.is_empty() || chem == t!("label.na").to_string() {
+        return None;
+    }
+    CHEMISTRY_TYPES
+        .iter()
+        .find(|(name, _)| *name == chem)
+        .map(|(_, v_per_cell)| v_per_cell * cells as f32)
 }
 
 fn write_csv(path: &std::path::Path, samples: &[Sample]) -> Result<()> {

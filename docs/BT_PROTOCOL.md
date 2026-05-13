@@ -208,6 +208,100 @@ The `el15-bt` library emits these events from the notification stream:
   fragmented as 20+8 byte chunks. On macOS, they arrive as a single 28-byte
   notification.
 
+## USB HID DFU Protocol (NON-VERIFIED! It can brick you device!)
+
+The device also exposes a USB HID interface (VID=`0x2e3c`, PID=`0x5745`, Usage Page `0xFF00`)
+used for firmware flashing. The same VID/PID is present in **normal** and **DFU** mode — the
+device does NOT enumerate as a standard STM32 DFU device (`0x0483:0xDF11`).
+
+To enter DFU mode: **Settings > Others > DFU** on the device screen.
+
+### HID reports
+
+- **64-byte** IN/OUT reports, no Report ID prefix.
+- 1-byte Feature report (unused in flashing).
+
+### Packet format
+
+Same framing as BLE but with different command IDs:
+
+```
+AF <cmd> <sub> <len> [<data[len]>] <csum>
+```
+
+Checksum: `csum = (256 - (sum_of_all_preceding_bytes % 256)) % 256`
+
+Responses use `DF` prefix.
+
+### DFU command sequence
+
+The firmware is split into **two segments**. Each segment follows the same pattern:
+AF11 (header) → AF12 (erase) → AF13 (data) → AF14 (commit). Then a final AF15 to verify/reboot.
+
+| Step | Cmd | Packet | Description |
+|------|-----|--------|-------------|
+| 1 | Query | `AF 10 00 00 41` | Query device info. Response has device serial. |
+| 2 | Seg-1 header | `AF 11 00 0D <atk[0..12]> <csum>` | Send first 13 bytes of `.atk` file. |
+| 3 | Seg-1 erase | `AF 12 00 00 3F` | Erase segment-1 flash area (~2 s). |
+| 4 | Seg-1 data | `AF 13 <addr> <len> <data…> <csum>` | Write segment-1 data. `addr` cycles `0x00..0xFF`. |
+| 5 | Seg-1 commit | `AF 14 00 00 3D` | Commit segment 1. |
+| 6 | Seg-2 header | `AF 11 00 0D <hdr2> <csum>` | Send derived segment-2 header (see below). |
+| 7 | Seg-2 erase | `AF 12 00 00 3F` | Erase segment-2 flash area (~5 s). |
+| 8 | Seg-2 data | `AF 13 <addr> <len> <data…> <csum>` | Write segment-2 data. `addr` resets to `0x00`. |
+| 9 | Seg-2 commit | `AF 14 00 00 3D` | Commit segment 2. |
+| 10 | Verify | `AF 15 00 01 <atk[4]> <csum>` | Verify and reboot. Payload = byte at `.atk` offset 4. |
+
+### Segment structure
+
+The `.atk` file is a raw binary image. The **segment-1 byte count** is encoded at file
+offsets `[6..9]` as a 3-byte little-endian integer:
+
+```
+seg1_size = u32::from_le_bytes([atk[6], atk[7], atk[8], 0]) as usize
+```
+
+- **Segment 1**: `atk[0 .. seg1_size]` — includes the 13-byte AF11 header at its start.
+- **Segment 2**: `atk[seg1_size ..]` — raw data; the 13 bytes of its AF11 header are derived.
+
+### Segment-2 AF11 header derivation
+
+The segment-2 header is not embedded in the file; it is computed from the segment-1 header:
+
+```
+hdr2 = atk[0..13].copy()
+hdr2[4]   = atk[4] + 1              // segment counter: 0xa0 → 0xa1
+hdr2[6..9] = (seg2_size).to_le_bytes()[..3]   // 3-byte LE byte count of segment 2
+```
+
+### Response format
+
+| Response | Meaning |
+|----------|---------|
+| `DF 10 00 <len> <data…>` | Device info (serial number as ASCII) |
+| `DF 11 00 01 00 …` | Header accepted |
+| `DF 12 00 01 00 …` | Erase complete |
+| `DF 13 <addr> 01 00 …` | Data chunk acknowledged |
+| `DF 14 00 01 00 …` | Commit complete |
+| `DF 15 00 01 00 …` | Verify success (status byte = `0x00`) |
+
+### ATK file format
+
+The `.atk` firmware file is a raw binary image. Key offsets:
+- `atk[0..12]`: Segment-1 header sent in its AF11 command; first 13 bytes of the file.
+- `atk[4]`: Verify byte sent in AF15 (e.g. `0xa0` for v1.7 firmware).
+- `atk[6..9]`: 3-byte LE integer = total byte count of segment 1 (including the 13-byte header).
+- `atk[seg1_size..]`: Segment-2 raw data; starts immediately after segment 1.
+
+### CLI usage
+
+```bash
+# Put device in DFU mode first (Settings > Others > DFU)
+./el15 --no-gui --flash firmware/atk_el15_v1.7.atk
+
+# Interactive HID probe shell
+./el15 --no-gui --dfu-probe
+```
+
 ## Reference
 
 - DM40GUI source: <https://github.com/maj113/DM40GUI/tree/master/el15>

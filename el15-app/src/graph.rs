@@ -11,7 +11,6 @@
 use std::collections::VecDeque;
 
 use chrono::{DateTime, Local};
-use iced::alignment::Horizontal;
 use iced::widget::canvas::{self, Cache, Frame, Geometry, Path, Stroke};
 use iced::widget::{canvas as canvas_widget, container};
 use iced::{mouse, Color, Element, Length, Point, Rectangle, Size, Theme};
@@ -316,8 +315,7 @@ fn draw_y_axis(frame: &mut Frame, x_off: f32, y_off: f32, graph_h: f32, min: f32
         let y = y_off + frac * graph_h;
         frame.fill_text(canvas::Text {
             content: format!("{:.2}", val),
-            position: Point::new(x_off - 50.0, y - 6.0),
-            horizontal_alignment: Horizontal::Right,
+            position: Point::new(x_off - 45.0, y - 6.0),
             color,
             size: 10.0.into(),
             ..Default::default()

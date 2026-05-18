@@ -79,7 +79,7 @@
   "graph.clear": "साफ़ करें",
   "settings.scpi_section": "SCPI सर्वर",
   "settings.firmware_section": "फर्मवेयर अपडेट",
-  "settings.firmware_note": "डिवाइस DFU मोड में होनी चाहिए (डिवाइस पर: सेटिंग्स > अन्य > DFU)।",
+  "settings.firmware_note": "डिवाइस DFU मोड में होना चाहिए: सेटिंग्स > अन्य > DFU, या USB कनेक्ट करते समय ⚙️ बटन दबाए रखें।",
   "settings.about_section": "के बारे में",
   "settings.repository": "रिपॉजिटरी:",
   "settings.verbose_ble": "विस्तृत BLE",
@@ -98,7 +98,7 @@
   "flash.error": "त्रुटि",
   "flash.step_header": "अपग्रेड चरण:",
   "flash.step_1": "1. EL15 को Type-C से पीसी से जोड़ें। कम चार्ज से स्टार्ट नहीं हो सकता।",
-  "flash.step_2": "2. डिवाइस पर: सेटिंग्स > अन्य > DFU चुनें।",
+  "flash.step_2": "2. DFU मोड में प्रवेश करें: डिवाइस पर सेटिंग्स > अन्य > DFU चुनें, या USB केबल कनेक्ट करते समय ⚙️ बटन दबाए रखें।",
   "flash.step_3": "3. फर्मवेयर फ़ाइल चुनें और अपग्रेड शुरू करें पर क्लिक करें।",
   "flash.step_4": "4. प्रगति पूरी होने तक प्रतीक्षा करें।",
   "flash.step_5": "5. डिवाइस स्वचालित रूप से रीबूट होगा।"

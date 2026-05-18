@@ -65,6 +65,10 @@ pub struct Cli {
     #[arg(long, value_name = "FIRMWARE.atk")]
     pub flash: Option<PathBuf>,
 
+    /// Verbose flash output: show every HID packet sent/received during firmware update.
+    #[arg(long)]
+    pub verbose_flash: bool,
+
     /// Interactive HID probe: scan command bytes and show device responses.
     /// Put the device in DFU mode (Settings > Others > DFU) first.
     #[arg(long)]

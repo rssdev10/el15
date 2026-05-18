@@ -34,7 +34,7 @@ el15 --list-usb                          # enumerate USB devices
 el15 --no-gui --scan                     # scan for BLE EL15 devices
 el15 --no-gui --port 5555                # connect to first EL15 + run SCPI server
 el15 --no-gui --device <id>              # connect to specific BLE id
-el15 --flash firmware.bin                # flash firmware via DFU
+el15 --flash firmware/atk_el15_v1.7.atk  # flash firmware via USB HID DFU
 el15 --no-gui --log scpi.log -v          # verbose + log SCPI to file
 ```
 

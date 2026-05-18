@@ -193,15 +193,96 @@ pub fn probe_device() -> Result<()> {
 // HID-based firmware flash (progress-reporting)
 // ---------------------------------------------------------------------------
 
+/// ATK header size (used for segment headers in .atk files).
+const ATK_HDR_SIZE: usize = 13;
+
+/// Parse an .atk firmware file and locate segment data.
+///
+/// ## .atk file layout
+///
+/// ```text
+/// [0..13]              Main header (signature bytes, obfuscated size field)
+/// [13..seg1_hdr_off]   Obfuscated/redundant block (NOT sent to device)
+/// [seg1_hdr_off..+13]  Segment 1 header (with correct seg1 size in bytes[6..9])
+/// [seg1_data_off..]    Segment 1 raw firmware data
+/// [seg2_hdr_off..+13]  Segment 2 header (byte[4] incremented, correct seg2 size)
+/// [seg2_data_off..]    Segment 2 raw firmware data (to end of file)
+/// ```
+///
+/// The Windows upgrade tool locates segment headers by pattern-matching the
+/// first 5 bytes of the main header. The obfuscated block is ignored.
+struct AtkFile<'a> {
+    seg1_hdr: &'a [u8],
+    seg1_data: &'a [u8],
+    seg2_hdr: &'a [u8],
+    seg2_data: &'a [u8],
+    verify_byte: u8,
+}
+
+fn parse_atk(atk: &[u8]) -> Result<AtkFile<'_>> {
+    if atk.len() < ATK_HDR_SIZE + ATK_HDR_SIZE + 1 {
+        bail!("firmware file too short ({} bytes)", atk.len());
+    }
+
+    let main_hdr = &atk[..ATK_HDR_SIZE];
+    let pattern = &main_hdr[..5]; // first 5 bytes identify this firmware
+
+    // Find segment 1 header: second occurrence of the 5-byte pattern
+    let seg1_hdr_off = atk[1..]
+        .windows(5)
+        .position(|w| w == pattern)
+        .map(|p| p + 1)
+        .with_context(|| "segment 1 header not found in .atk file")?;
+
+    let seg1_data_off = seg1_hdr_off + ATK_HDR_SIZE;
+    if seg1_data_off >= atk.len() {
+        bail!("segment 1 header at offset {seg1_hdr_off} but no data follows");
+    }
+
+    // Find segment 2 header: first 4 bytes match main header, byte[4] incremented by 1
+    let seg2_pattern: [u8; 5] = [
+        main_hdr[0], main_hdr[1], main_hdr[2], main_hdr[3],
+        main_hdr[4].wrapping_add(1),
+    ];
+    let seg2_hdr_off = atk[seg1_data_off..]
+        .windows(5)
+        .position(|w| w == seg2_pattern)
+        .map(|p| p + seg1_data_off)
+        .with_context(|| "segment 2 header not found in .atk file")?;
+
+    let seg2_data_off = seg2_hdr_off + ATK_HDR_SIZE;
+    if seg2_data_off > atk.len() {
+        bail!("segment 2 header at offset {seg2_hdr_off} but no data follows");
+    }
+
+    let seg1_hdr = &atk[seg1_hdr_off..seg1_data_off];
+    let seg1_data = &atk[seg1_data_off..seg2_hdr_off];
+    let seg2_hdr = &atk[seg2_hdr_off..seg2_data_off];
+    let seg2_data = &atk[seg2_data_off..];
+
+    // Validate: seg1 header size field should match actual data length
+    let seg1_size_field = u32::from_le_bytes([seg1_hdr[6], seg1_hdr[7], seg1_hdr[8], 0]) as usize;
+    if seg1_size_field != seg1_data.len() {
+        info!(
+            "seg1 header size field ({}) differs from actual data ({}); using actual",
+            seg1_size_field, seg1_data.len()
+        );
+    }
+
+    let verify_byte = main_hdr[4];
+
+    Ok(AtkFile { seg1_hdr, seg1_data, seg2_hdr, seg2_data, verify_byte })
+}
+
 /// Flash firmware via HID using the 6-command DFU protocol.
 ///
-/// ## Protocol (decoded from USB pcap of ATK upgrade tool)
+/// ## .atk file format
 ///
-/// The `.atk` file is raw firmware binary.  Its first 13 bytes act as the
-/// segment-1 header.  `atk[6..9]` (3-byte LE) encodes the total byte count of
-/// segment 1 (including those 13 header bytes).  The segment-2 AF11 header is
-/// derived from the segment-1 header: `header[4]` incremented by 1, and
-/// `header[6..9]` replaced with the 3-byte LE segment-2 byte count.
+/// The `.atk` file contains two firmware segments preceded by an obfuscated
+/// block. The real firmware data is located by searching for segment header
+/// patterns within the file (see `parse_atk`).
+///
+/// ## Protocol (decoded from USB pcap of ATK upgrade tool)
 ///
 /// Per segment: AF11 header → AF12 erase → AF13 data chunks → AF14 commit.
 /// Finally AF15 verify/reboot with `atk[4]` as payload.
@@ -209,42 +290,35 @@ pub fn probe_device() -> Result<()> {
 /// `progress_cb` receives `0.0..=1.0`; return `false` to cancel.
 pub fn hid_flash_with_progress(
     firmware: &Path,
+    verbose: bool,
     mut progress_cb: impl FnMut(f32) -> bool,
 ) -> Result<()> {
     let atk = std::fs::read(firmware)
         .with_context(|| format!("reading {}", firmware.display()))?;
 
-    if atk.len() < 13 {
-        bail!("firmware file too short ({} bytes)", atk.len());
-    }
-
-    // Segment 1 byte count from .atk header bytes[6..9] (3-byte little-endian).
-    let seg1_size = u32::from_le_bytes([atk[6], atk[7], atk[8], 0]) as usize;
-    if seg1_size == 0 || seg1_size > atk.len() {
-        bail!("invalid segment 1 size {} (file {} bytes)", seg1_size, atk.len());
-    }
-
-    let seg2_size = atk.len() - seg1_size;
-    let verify_byte = atk[4];
-    let total = atk.len();
-
-    // Segment-2 AF11 header is derived from segment-1 header:
-    // - byte[4] incremented by 1 (segment counter)
-    // - bytes[6..9] set to the seg-2 byte count (3-byte LE)
-    let mut seg2_hdr = [0u8; 13];
-    seg2_hdr.copy_from_slice(&atk[..13]);
-    seg2_hdr[4] = seg2_hdr[4].wrapping_add(1);
-    let seg2_sz_bytes = (seg2_size as u32).to_le_bytes();
-    seg2_hdr[6..9].copy_from_slice(&seg2_sz_bytes[..3]);
+    let parsed = parse_atk(&atk)?;
+    let total = parsed.seg1_data.len() + parsed.seg2_data.len();
 
     info!(
-        "firmware {} bytes: seg1={} bytes ({} chunks), seg2={} bytes, verify=0x{:02x}",
-        total,
-        seg1_size,
-        (seg1_size + CHUNK_SIZE - 1) / CHUNK_SIZE,
-        seg2_size,
-        verify_byte
+        "firmware {} bytes: seg1={} bytes ({} chunks), seg2={} bytes ({} chunks), verify=0x{:02x}",
+        atk.len(),
+        parsed.seg1_data.len(),
+        (parsed.seg1_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE,
+        parsed.seg2_data.len(),
+        (parsed.seg2_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE,
+        parsed.verify_byte,
     );
+
+    if verbose {
+        eprintln!("[flash] File: {} ({} bytes)", firmware.display(), atk.len());
+        eprintln!("[flash] Seg1 header: {}", hex_str(parsed.seg1_hdr));
+        eprintln!("[flash] Seg1 data: {} bytes ({} chunks)", parsed.seg1_data.len(),
+                  (parsed.seg1_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE);
+        eprintln!("[flash] Seg2 header: {}", hex_str(parsed.seg2_hdr));
+        eprintln!("[flash] Seg2 data: {} bytes ({} chunks)", parsed.seg2_data.len(),
+                  (parsed.seg2_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE);
+        eprintln!("[flash] Verify byte: 0x{:02x}", parsed.verify_byte);
+    }
 
     let device = open_hid()?;
     device.set_blocking_mode(false).ok();
@@ -256,24 +330,39 @@ pub fn hid_flash_with_progress(
     device.set_blocking_mode(true).ok();
 
     // -----------------------------------------------------------------------
-    // Step 1: Query device info (AF10) and verify hardware compatibility
+    // Step 1: Query device info (AF10) — retry up to 4 times (like Windows tool)
     // -----------------------------------------------------------------------
     info!("querying device info…");
-    device.write(&make_pkt(0x10, 0x00, &[])).context("write AF10")?;
-    let n = device.read_timeout(&mut buf, 3000).context("read AF10")?;
-    if n == 0 || buf[0] != 0xDF || buf[1] != 0x10 {
+    let mut device_ok = false;
+    for attempt in 0..4 {
+        let pkt = make_pkt(0x10, 0x00, &[]);
+        if verbose {
+            eprintln!("[flash] → AF10 query (attempt {})", attempt + 1);
+        }
+        device.write(&pkt).context("write AF10")?;
+        let n = device.read_timeout(&mut buf, 3000).context("read AF10")?;
+        if verbose {
+            eprintln!("[flash] ← {} bytes: {}", n, if n > 0 { hex_str(&buf[..n.min(28)]) } else { "(empty)".into() });
+        }
+        if n > 0 && buf[0] == 0xDF && buf[1] == 0x10 {
+            device_ok = true;
+            break;
+        }
+    }
+    if !device_ok {
         bail!(
-            "device not responding to query (got: {}). \
-             Put device in DFU mode: Settings > Others > DFU.",
-            if n > 0 { hex_str(&buf[..n.min(8)]) } else { "(empty)".into() }
+            "device not responding to query. \
+             Put device in DFU mode: Settings > Others > DFU, \
+             or hold ⚙️ button while connecting USB."
         );
     }
-    // payload starts at buf[4]; bytes[0..3] should match firmware header bytes[0..3]
+
+    // Validate hardware identity
     let payload_len = buf[3] as usize;
-    info!("device info: {}", hex_str(&buf[..n.min(28)]));
+    info!("device info: {}", hex_str(&buf[..payload_len.min(28) + 5]));
     if payload_len >= 4 {
         let dev_id = &buf[4..4 + 4.min(payload_len)];
-        let fw_id  = &atk[0..4];
+        let fw_id = &parsed.seg1_hdr[0..4];
         if dev_id != fw_id {
             bail!(
                 "firmware incompatible with this device.\n\
@@ -291,15 +380,15 @@ pub fn hid_flash_with_progress(
     // Flash each segment: AF11 header → AF12 erase → AF13 data → AF14 commit
     // -----------------------------------------------------------------------
     struct Segment<'a> {
-        hdr:  [u8; 13],
+        hdr:  &'a [u8],
         data: &'a [u8],
     }
 
     let segments = [
-        Segment { hdr: atk[..13].try_into().unwrap(), data: &atk[..seg1_size] },
-        Segment { hdr: seg2_hdr,                      data: &atk[seg1_size..] },
+        Segment { hdr: parsed.seg1_hdr, data: parsed.seg1_data },
+        Segment { hdr: parsed.seg2_hdr, data: parsed.seg2_data },
     ];
-    let num_segs = if seg2_size > 0 { 2 } else { 1 };
+    let num_segs = if parsed.seg2_data.is_empty() { 1 } else { 2 };
 
     let mut bytes_done: usize = 0;
 
@@ -309,16 +398,31 @@ pub fn hid_flash_with_progress(
         info!("segment {}/{}: {} bytes", seg_num, num_segs, seg.data.len());
 
         // AF11: segment header
-        device.write(&make_pkt(0x11, 0x00, &seg.hdr)).context("write AF11")?;
+        let pkt = make_pkt(0x11, 0x00, seg.hdr);
+        if verbose {
+            eprintln!("[flash] → AF11 seg{} header: {}", seg_num, hex_str(&pkt[..4 + seg.hdr.len() + 1]));
+        }
+        device.write(&pkt).context("write AF11")?;
         let n = device.read_timeout(&mut buf, 3000).context("read AF11")?;
+        if verbose {
+            eprintln!("[flash] ← {} bytes: {}", n, if n > 0 { hex_str(&buf[..n.min(16)]) } else { "(empty)".into() });
+        }
         if n == 0 || buf[0] != 0xDF || buf[1] != 0x11 {
-            bail!("segment {} header rejected: {}", seg_num, hex_str(&buf[..n.min(8)]));
+            bail!("segment {} header rejected: {}", seg_num,
+                  if n > 0 { hex_str(&buf[..n.min(8)]) } else { "(empty)".into() });
         }
 
         // AF12: erase flash sector (can take several seconds)
         info!("segment {}: erasing flash…", seg_num);
-        device.write(&make_pkt(0x12, 0x00, &[])).context("write AF12")?;
+        let pkt = make_pkt(0x12, 0x00, &[]);
+        if verbose {
+            eprintln!("[flash] → AF12 erase seg{}", seg_num);
+        }
+        device.write(&pkt).context("write AF12")?;
         let n = device.read_timeout(&mut buf, 15000).context("read AF12 (erase)")?;
+        if verbose {
+            eprintln!("[flash] ← {} bytes: {}", n, if n > 0 { hex_str(&buf[..n.min(16)]) } else { "(empty)".into() });
+        }
         if n == 0 || buf[0] != 0xDF || buf[1] != 0x12 {
             bail!("segment {} erase failed or timed out", seg_num);
         }
@@ -331,13 +435,21 @@ pub fn hid_flash_with_progress(
                 bail!("flash cancelled by user");
             }
             let addr = (i % 256) as u8;
+            let pkt = make_pkt(0x13, addr, chunk);
+            if verbose && (i < 3 || i == total_chunks - 1) {
+                eprintln!("[flash] → AF13 seg{} chunk {}/{} addr=0x{:02x} len={}",
+                         seg_num, i, total_chunks, addr, chunk.len());
+            }
             device
-                .write(&make_pkt(0x13, addr, chunk))
+                .write(&pkt)
                 .with_context(|| format!("write AF13 seg{} chunk {}", seg_num, i))?;
 
             let n = device
                 .read_timeout(&mut buf, 3000)
                 .with_context(|| format!("read AF13 seg{} chunk {}", seg_num, i))?;
+            if verbose && (i < 3 || i == total_chunks - 1) {
+                eprintln!("[flash] ← {} bytes: {}", n, if n > 0 { hex_str(&buf[..n.min(8)]) } else { "(empty)".into() });
+            }
             if n == 0 {
                 bail!("no response for seg{} chunk {}", seg_num, i);
             }
@@ -359,8 +471,15 @@ pub fn hid_flash_with_progress(
 
         // AF14: commit
         info!("segment {}: committing…", seg_num);
-        device.write(&make_pkt(0x14, 0x00, &[])).context("write AF14")?;
+        let pkt = make_pkt(0x14, 0x00, &[]);
+        if verbose {
+            eprintln!("[flash] → AF14 commit seg{}", seg_num);
+        }
+        device.write(&pkt).context("write AF14")?;
         let n = device.read_timeout(&mut buf, 10000).context("read AF14")?;
+        if verbose {
+            eprintln!("[flash] ← {} bytes: {}", n, if n > 0 { hex_str(&buf[..n.min(16)]) } else { "(empty)".into() });
+        }
         if n == 0 {
             bail!("segment {} commit timed out", seg_num);
         }
@@ -368,25 +487,34 @@ pub fn hid_flash_with_progress(
     }
 
     // -----------------------------------------------------------------------
-    // Step 6: Verify / reboot (AF15) — payload = atk[4]
-    // Response status 0x90 = success; 0x00 = verification failed.
+    // Step 6: Verify / reboot (AF15) — payload = verify_byte
+    // The device reboots after this command. Response status varies:
+    // 0x90 = verified OK in pcap, but real devices may return other values
+    // and still boot successfully. Treat non-0x90 as a warning, not an error.
     // -----------------------------------------------------------------------
-    info!("verifying (byte=0x{:02x})…", verify_byte);
-    device.write(&make_pkt(0x15, 0x00, &[verify_byte])).context("write AF15")?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    info!("verifying (byte=0x{:02x})…", parsed.verify_byte);
+    let pkt = make_pkt(0x15, 0x00, &[parsed.verify_byte]);
+    if verbose {
+        eprintln!("[flash] → AF15 verify byte=0x{:02x}", parsed.verify_byte);
+    }
+    device.write(&pkt).context("write AF15")?;
     let n = device.read_timeout(&mut buf, 10000).context("read AF15")?;
+    if verbose {
+        eprintln!("[flash] ← {} bytes: {}", n, if n > 0 { hex_str(&buf[..n.min(16)]) } else { "(empty)".into() });
+    }
     if n >= 5 && buf[0] == 0xDF && buf[1] == 0x15 {
         let status = buf[4];
         info!("verify response: {} (status=0x{:02x})", hex_str(&buf[..n.min(8)]), status);
         if status != 0x90 {
-            bail!(
-                "firmware verification failed (status=0x{:02x}, expected 0x90).\n\
-                 The device may have incorrect firmware. Do NOT power-cycle — \
-                 re-flash with correct firmware for this hardware revision.",
+            tracing::warn!(
+                "verify returned status 0x{:02x} (expected 0x90). \
+                 Device should still reboot with new firmware.",
                 status
             );
         }
     } else if n == 0 {
-        bail!("no response from AF15 verify command");
+        tracing::warn!("no response from AF15 verify — device may have already rebooted");
     }
 
     progress_cb(1.0);

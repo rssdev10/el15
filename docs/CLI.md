@@ -14,9 +14,8 @@ CLI-only OPTIONS:
       --scan                   BLE scan and print results
       --device <NAME_OR_ID>    Connect to this BLE device (id or name)
       --list-usb               Enumerate USB devices and highlight EL15
-      --flash <FIRMWARE.bin>   Flash firmware via DFU and exit (NOT TESTED!!!)
-      --usb-vid <HEX>          DFU vendor ID override (default 0x0483)
-      --usb-pid <HEX>          DFU product ID override (default 0xDF11)
+      --flash <FIRMWARE.atk>   Flash firmware via USB HID DFU and exit
+      --verbose-flash          Show all DFU packet exchanges during flash
 
   -h, --help            Print help
   -V, --version         Print version
@@ -40,8 +39,11 @@ el15 --no-gui --device 78:DB:2F:11:22:33
 # USB inventory
 el15 --list-usb
 
-# Flash firmware
-el15 --flash ./EL15_v1.2.bin
+# Flash firmware (device must be in DFU mode)
+el15 --flash ./firmware/atk_el15_v1.7.atk
+
+# Flash with verbose packet logging
+el15 --flash ./firmware/atk_el15_v1.7.atk --verbose-flash
 ```
 
 ## SCPI logging line format

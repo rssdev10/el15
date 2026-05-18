@@ -79,7 +79,7 @@
   "graph.clear": "Limpiar",
   "settings.scpi_section": "Servidor SCPI",
   "settings.firmware_section": "Actualización de firmware",
-  "settings.firmware_note": "El dispositivo debe estar en modo DFU (Ajustes > Otros > DFU en el dispositivo).",
+  "settings.firmware_note": "El dispositivo debe estar en modo DFU: Ajustes > Otros > DFU, o mantener presionado el botón ⚙️ al conectar USB.",
   "settings.about_section": "Acerca de",
   "settings.repository": "Repositorio:",
   "settings.verbose_ble": "BLE detallado",
@@ -98,7 +98,7 @@
   "flash.error": "Error",
   "flash.step_header": "Pasos de actualización:",
   "flash.step_1": "1. Conecte el EL15 al PC mediante Type-C. Una batería baja puede impedir el inicio.",
-  "flash.step_2": "2. En el EL15: Ajustes > Otros > DFU para entrar en modo de actualización.",
+  "flash.step_2": "2. Entrar en modo DFU: en el EL15 seleccione Ajustes > Otros > DFU, o mantenga presionado el botón ⚙️ al conectar el cable USB.",
   "flash.step_3": "3. Seleccione el archivo de firmware y haga clic en Iniciar actualización.",
   "flash.step_4": "4. Espere a que la barra de progreso se complete.",
   "flash.step_5": "5. El dispositivo se reiniciará automáticamente y saldrá del modo de actualización."

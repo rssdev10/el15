@@ -580,7 +580,7 @@ impl AppState {
                 let tx_done = tx.clone();
                 tokio::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::hid_flash::hid_flash_with_progress(&path, |progress| {
+                        crate::hid_flash::hid_flash_with_progress(&path, false, |progress| {
                             let _ = tx.send(Message::FlashProgress(progress));
                             !cancel.load(Ordering::Relaxed)
                         })
@@ -1540,7 +1540,7 @@ impl AppState {
                     button(text("GitHub").size(12)).padding([3, 8]).on_press(Message::OpenRepo),
                 ].spacing(6).align_y(iced::Alignment::Center),
 
-                // Firmware update section 
+                // Firmware update section
                 // Space::with_height(Length::Fixed(20.0)),
                 // text(t!("settings.firmware_section")).size(16),
                 // text(t!("settings.firmware_note")).size(12),

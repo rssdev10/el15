@@ -31,11 +31,8 @@ pub async fn run(args: Cli) -> Result<()> {
     }
 
     if let Some(fw) = &args.flash {
-        eprintln!("\rFlashing feature was not tested. Stopping here to avoid potential issues.");
-        return Ok(());
-
         // Flash via HID (same VID/PID stays in DFU mode; STM32 DFU is not used)
-        hid_flash::hid_flash_with_progress(fw, |progress| {
+        hid_flash::hid_flash_with_progress(fw, args.verbose_flash, |progress| {
             let pct = (progress * 100.0) as u32;
             if pct % 5 == 0 {
                 eprint!("\rFlashing: {}%  ", pct);

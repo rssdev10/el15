@@ -79,7 +79,7 @@
   "graph.clear": "清除",
   "settings.scpi_section": "SCPI 服务器",
   "settings.firmware_section": "固件更新",
-  "settings.firmware_note": "设备须处于 DFU 模式（设备上：设置 > 其他 > DFU）。",
+  "settings.firmware_note": "设备需处于DFU模式：设置 > 其他 > DFU，或在连接USB时按住⚙️按钮。",
   "settings.about_section": "关于",
   "settings.repository": "代码仓库:",
   "settings.verbose_ble": "详细 BLE",
@@ -98,7 +98,7 @@
   "flash.error": "错误",
   "flash.step_header": "升级步骤：",
   "flash.step_1": "1. 通过 Type-C 将 EL15 连接到电脑。电量不足可能导致无法启动。",
-  "flash.step_2": "2. 在设备上：设置 > 其他 > DFU 进入升级模式。",
+  "flash.step_2": "2. 进入DFU模式：在设备上选择 设置 > 其他 > DFU，或在连接USB线时按住⚙️按钮。",
   "flash.step_3": "3. 选择固件文件并点击「开始升级」。",
   "flash.step_4": "4. 等待进度条完成。",
   "flash.step_5": "5. 设备将自动重启并退出升级模式。"

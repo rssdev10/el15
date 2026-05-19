@@ -150,9 +150,76 @@ Located in the right column, below the info cards. Hidden for CC/CV/CR/CP modes.
 - Windows uses embedded .ico resource for taskbar/explorer.
 
 ## Settings Page
-- Theme, Language, Poll interval, Auto-connect toggle
-- SCPI Server section: enable/port
-- About section: version display, GitHub repository link (opens browser)
+
+Responsive card-based layout. On wide windows (≥720px), cards are arranged in two columns. On narrow windows, they collapse to a single column.
+
+### Cards
+
+1. **Application**
+   - Theme (dropdown: Light/Dark)
+   - Language (dropdown)
+   - Poll interval (dropdown: 50/100/200/500/1000/2000 ms; helper text below)
+   - Auto-connect to first EL15 (toggle)
+
+2. **SCPI Server**
+   - Enable SCPI server (toggle)
+   - SCPI port (text input; helper text below)
+
+3. **Maintenance**
+   - Description text
+   - "Open Firmware Update" button → opens the dedicated Firmware Update page
+
+4. **About**
+   - App name + version
+   - Repository link (GitHub button opens browser)
+
+Footer: "Settings are saved automatically."
+
+Close button at the bottom.
+
+## Firmware Update Page
+
+Dedicated secondary page accessed from Settings > Maintenance > "Open Firmware Update".
+
+### Layout (top → bottom)
+
+1. **Title**: "Firmware Update"
+2. **Upgrade steps card** (bordered box with numbered instructions)
+3. **DFU connection status** (bordered box):
+   - "DFU device: Ready" (green) — when a DFU USB device is detected
+   - "DFU device: Not detected" (amber) — when no DFU device found
+   - Polled every 2 seconds while on this page
+4. **Firmware file**: label showing selected filename or "No file selected"
+5. **Select Firmware File** button
+6. **Start Upgrade** / **Stop** buttons
+7. **Helper text** (when Start Upgrade is disabled):
+   - No file + no DFU: "Select a firmware file and connect the device in DFU mode before starting the upgrade."
+   - No file only: "Select a firmware file before starting the upgrade."
+   - No DFU only: "Start Upgrade is disabled until a DFU device is detected."
+8. **Progress bar**
+9. **Status text** (progress %, error, or completion message)
+10. **Close** button
+
+### Start Upgrade Button Rules
+
+Disabled unless ALL of:
+- A firmware file is selected
+- A DFU device is detected and ready
+- No firmware upgrade is currently running
+
+### Confirmation Dialog
+
+Before flashing begins, a confirmation dialog appears:
+- Warning that firmware update may interrupt the device
+- Device must be in DFU mode
+- USB/power must not be disconnected
+- Buttons: Cancel / Continue
+
+Only after "Continue" does flashing actually begin.
+
+### Stop Button
+
+Enabled only while an upgrade is running.
 
 ## Disconnection Detection
 - When a BLE poll command fails (device powered off), the app detects disconnection.

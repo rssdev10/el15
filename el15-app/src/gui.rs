@@ -34,6 +34,8 @@ use el15_bt::{
     DeviceInfo, EL15Status, Mode, CMD_LOAD_OFF, CMD_LOAD_ON,
 };
 
+use el15_scpi::{ScpiServer, ScpiServerConfig, SharedState as ScpiSharedState};
+
 use crate::cli::Cli;
 use crate::i18n::{self, t};
 use crate::settings::{self, GraphLayout, GraphTimeMode, ModeKind, Settings, Theme as AppTheme};
@@ -158,6 +160,17 @@ pub enum Message {
     ClearGraph,
     WindowResized(f32, f32),
     OpenRepo,
+    // ---- Settings ----
+    ToggleScpiEnabled,
+    SetPollInterval(u64),
+    ScpiPortChanged(String),
+    ApplyScpiPort,
+    ScpiServerStart,
+    // ---- DFU / Firmware ----
+    DfuPollTick,
+    DfuPollResult(bool),
+    ConfirmFlash,
+    CancelFlashConfirm,
     Noop,
 }
 
@@ -215,6 +228,19 @@ pub struct AppState {
     /// writes (poll vs command) from racing on the same characteristic, which
     /// causes the device to silently ignore the command on some BLE stacks.
     pause_poll_ticks: u8,
+
+    // ---- DFU detection (flash page) ----
+    dfu_detected: bool,
+
+    // ---- Pending firmware flash confirmation ----
+    flash_confirm_path: Option<PathBuf>,
+
+    // ---- Settings editable inputs ----
+    scpi_port_input: String,
+
+    // ---- SCPI server (GUI mode) ----
+    scpi_state: ScpiSharedState,
+    scpi_server_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AppState {
@@ -253,6 +279,11 @@ impl AppState {
             flash_error: None,
             flash_cancel_flag: None,
             pause_poll_ticks: 0,
+            dfu_detected: false,
+            flash_confirm_path: None,
+            scpi_port_input: settings.scpi.port.to_string(),
+            scpi_state: ScpiSharedState::default(),
+            scpi_server_task: None,
         };
 
         // If a previously connected device ID is saved, do a quick targeted scan
@@ -277,7 +308,12 @@ impl AppState {
         };
 
         let font_task = Task::none();
-        (s, Task::batch([startup_task, font_task]))
+        let scpi_start_task: Task<Message> = if settings.scpi.enabled {
+            Task::perform(std::future::ready(()), |_| Message::ScpiServerStart)
+        } else {
+            Task::none()
+        };
+        (s, Task::batch([startup_task, font_task, scpi_start_task]))
     }
 
     fn title(&self) -> String {
@@ -400,6 +436,9 @@ impl AppState {
                 let _ = settings::save(&self.settings);
                 if let Some(d) = CONNECTED_DEVICE.get().unwrap().lock().unwrap().take() {
                     self.device = Some(d.clone());
+                    let scpi_state = self.scpi_state.clone();
+                    let d_scpi = d.clone();
+                    tokio::spawn(async move { scpi_state.set_device(Some(d_scpi)).await; });
                     // Re-send init handshake now that the event-forwarding chain is
                     // fully established.  The first init inside the connect task may
                     // race with the subscription setup on some BLE stacks, causing
@@ -433,6 +472,8 @@ impl AppState {
                 self.device = None;
                 self.last_status = None;
                 self.firmware_version = None;
+                let scpi_state = self.scpi_state.clone();
+                tokio::spawn(async move { scpi_state.set_device(None).await; });
             }
             Message::DeviceEvent(ev) => match ev {
                 DeviceEvent::Status(st) => {
@@ -590,6 +631,8 @@ impl AppState {
                 self.show_flash_page = true;
                 self.flash_error = None;
                 self.flash_progress = 0.0;
+                self.dfu_detected = false;
+                return check_dfu_task();
             }
             Message::CloseFlashPage => {
                 // Don't close while actively flashing
@@ -608,6 +651,11 @@ impl AppState {
                 }
             }
             Message::StartFlash(path) => {
+                // Store path and show confirmation dialog before flashing
+                self.flash_confirm_path = Some(path);
+            }
+            Message::ConfirmFlash => {
+                let Some(path) = self.flash_confirm_path.take() else { return Task::none(); };
                 info!("flash firmware {}", path.display());
                 self.flashing = true;
                 self.flash_progress = 0.0;
@@ -634,6 +682,9 @@ impl AppState {
                 return Task::stream(
                     UnboundedReceiverStream::new(rx)
                 );
+            }
+            Message::CancelFlashConfirm => {
+                self.flash_confirm_path = None;
             }
             Message::FlashProgress(p) => {
                 self.flash_progress = p;
@@ -705,6 +756,46 @@ impl AppState {
             Message::ToggleAutoConnect => {
                 self.settings.auto_connect = !self.settings.auto_connect;
                 let _ = settings::save(&self.settings);
+            }
+            Message::ToggleScpiEnabled => {
+                self.settings.scpi.enabled = !self.settings.scpi.enabled;
+                let _ = settings::save(&self.settings);
+                if self.settings.scpi.enabled {
+                    self.start_scpi_server();
+                } else {
+                    self.stop_scpi_server();
+                }
+            }
+            Message::SetPollInterval(ms) => {
+                self.settings.poll_interval_ms = ms;
+                let _ = settings::save(&self.settings);
+            }
+            Message::ScpiPortChanged(s) => {
+                self.scpi_port_input = s;
+            }
+            Message::ApplyScpiPort => {
+                if let Ok(port) = self.scpi_port_input.trim().parse::<u16>() {
+                    if port > 0 {
+                        let was_running = self.scpi_server_task.is_some();
+                        self.stop_scpi_server();
+                        self.settings.scpi.port = port;
+                        let _ = settings::save(&self.settings);
+                        if was_running {
+                            self.start_scpi_server();
+                        }
+                    }
+                }
+            }
+            Message::ScpiServerStart => {
+                if self.settings.scpi.enabled {
+                    self.start_scpi_server();
+                }
+            }
+            Message::DfuPollTick => {
+                return check_dfu_task();
+            }
+            Message::DfuPollResult(detected) => {
+                self.dfu_detected = detected;
             }
             Message::ToggleLogging => {
                 self.settings.logging_paused = !self.settings.logging_paused;
@@ -859,7 +950,12 @@ impl AppState {
         let win_resize = window::resize_events().map(|(_id, size)| {
             Message::WindowResized(size.width, size.height)
         });
-        Subscription::batch([tick, events, win_resize])
+        let dfu_poll: Subscription<Message> = if self.show_flash_page && !self.flashing {
+            iced::time::every(Duration::from_secs(2)).map(|_| Message::DfuPollTick)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([tick, events, win_resize, dfu_poll])
     }
 
     fn subscribe_to_events(&self) -> Subscription<Message> {
@@ -880,11 +976,37 @@ impl AppState {
         })
     }
 
+    // ---- SCPI server management (GUI mode) ----------------------------------
+
+    fn start_scpi_server(&mut self) {
+        self.stop_scpi_server();
+        let bind: std::net::SocketAddr = format!("0.0.0.0:{}", self.settings.scpi.port)
+            .parse()
+            .unwrap_or_else(|_| "0.0.0.0:5555".parse().unwrap());
+        let state = self.scpi_state.clone();
+        let handle = tokio::spawn(async move {
+            let server = ScpiServer::new(state, ScpiServerConfig { bind });
+            if let Err(e) = server.run().await {
+                warn!("SCPI server stopped: {e}");
+            }
+        });
+        self.scpi_server_task = Some(handle);
+        info!("SCPI server started on port {}", self.settings.scpi.port);
+    }
+
+    fn stop_scpi_server(&mut self) {
+        if let Some(handle) = self.scpi_server_task.take() {
+            handle.abort();
+            info!("SCPI server stopped");
+        }
+    }
+
     // ---- view -----------------------------------------------------------
 
     fn view(&self) -> Element<'_, Message> {
         if self.show_settings { return self.view_settings(); }
         if self.show_confirm { return self.view_confirm(); }
+        if self.flash_confirm_path.is_some() { return self.view_flash_confirm(); }
         if self.show_flash_page { return self.view_flash_page(); }
 
         let st = self.last_status.clone().unwrap_or_default();
@@ -1450,6 +1572,25 @@ impl AppState {
             t!("flash.step_5"),
         );
 
+        // DFU connection status
+        let (dfu_label, dfu_color) = if self.dfu_detected {
+            (t!("flash.dfu_ready").to_string(), COLOR_LOAD_ON)
+        } else {
+            (t!("flash.dfu_not_detected").to_string(), Color::from_rgb(0.85, 0.50, 0.10))
+        };
+        let dfu_status = container(
+            column![
+                text(t!("flash.dfu_status")).size(13),
+                Space::new().height(4.0),
+                text(dfu_label).size(13).color(dfu_color),
+            ]
+            .spacing(0),
+        )
+        .padding(12)
+        .style(container::bordered_box)
+        .width(Length::Fill);
+
+        // Firmware file display
         let firmware_label = match &self.flash_firmware_path {
             Some(p) => p.file_name()
                 .and_then(|n| n.to_str())
@@ -1462,13 +1603,17 @@ impl AppState {
             .padding([6, 14])
             .on_press(Message::SelectFirmwareFile);
 
+        // Determine whether Start Upgrade is enabled
+        let has_file = self.flash_firmware_path.is_some();
+        let can_start = has_file && self.dfu_detected && !self.flashing;
+
         let start_btn = {
             let b = button(text(t!("btn.start_flash")).size(13)).padding([6, 14]);
-            if self.flashing || self.flash_firmware_path.is_none() {
-                b
-            } else {
+            if can_start {
                 let path = self.flash_firmware_path.clone().unwrap();
                 b.on_press(Message::StartFlash(path))
+            } else {
+                b
             }
         };
 
@@ -1490,6 +1635,23 @@ impl AppState {
             }
         };
 
+        // Helper text explaining why Start Upgrade is disabled
+        let helper_text: Element<'_, Message> = if !self.flashing && !can_start {
+            let msg = match (has_file, self.dfu_detected) {
+                (false, false) => t!("flash.help_no_file_no_dfu").to_string(),
+                (false, true)  => t!("flash.help_no_file").to_string(),
+                (true, false)  => t!("flash.help_no_dfu").to_string(),
+                (true, true)   => String::new(),
+            };
+            if !msg.is_empty() {
+                text(msg).size(12).color(Color::from_rgb(0.75, 0.75, 0.40)).into()
+            } else {
+                Space::new().height(0.0).into()
+            }
+        } else {
+            Space::new().height(0.0).into()
+        };
+
         let status_text: Element<'_, Message> = if self.flashing {
             text(format!("{} {:.0}%", t!("flash.progress"), self.flash_progress * 100.0)).size(13).into()
         } else if let Some(err) = &self.flash_error {
@@ -1508,18 +1670,20 @@ impl AppState {
                     .padding(12)
                     .style(container::bordered_box)
                     .width(Length::Fill),
-                Space::new().height(16.0),
-                row![
-                    select_btn,
-                    Space::new().width(10.0),
-                    text(firmware_label).size(13),
-                ].align_y(iced::Alignment::Center),
-                Space::new().height(8.0),
+                Space::new().height(12.0),
+                dfu_status,
+                Space::new().height(12.0),
+                text(format!("{} {}", t!("flash.firmware_file"), firmware_label)).size(13),
+                Space::new().height(6.0),
+                select_btn,
+                Space::new().height(12.0),
                 row![
                     start_btn,
                     Space::new().width(10.0),
                     stop_btn,
                 ].spacing(0).align_y(iced::Alignment::Center),
+                Space::new().height(6.0),
+                helper_text,
                 Space::new().height(12.0),
                 container(progress_bar(0.0..=1.0, self.flash_progress))
                     .height(20)
@@ -1538,6 +1702,9 @@ impl AppState {
     }
 
     fn view_settings(&self) -> Element<'_, Message> {
+        let wide = self.settings.window_width >= 720.0;
+
+        // ---- Application card ----
         let theme_pick = pick_list(
             vec![AppTheme::Light, AppTheme::Dark],
             Some(self.settings.theme),
@@ -1548,48 +1715,213 @@ impl AppState {
             Some(self.settings.language.clone()),
             Message::ChangeLanguage,
         );
+        let poll_options: Vec<u64> = vec![50, 100, 200, 500, 1000, 2000];
+        let poll_pick = pick_list(
+            poll_options,
+            Some(self.settings.poll_interval_ms),
+            Message::SetPollInterval,
+        );
+        let auto_connect_toggle = button(
+            text(if self.settings.auto_connect { "ON" } else { "OFF" }).size(12),
+        )
+        .padding([4, 12])
+        .on_press(Message::ToggleAutoConnect);
+
+        let app_card = container(
+            column![
+                text(t!("settings.card.application")).size(15),
+                Space::new().height(10.0),
+                row![
+                    text(t!("settings.theme")).size(13),
+                    Space::new().width(Length::Fill),
+                    theme_pick,
+                ].align_y(iced::Alignment::Center),
+                row![
+                    text(t!("settings.language")).size(13),
+                    Space::new().width(Length::Fill),
+                    lang_pick,
+                ].align_y(iced::Alignment::Center),
+                row![
+                    column![
+                        text(t!("settings.poll")).size(13),
+                        text(t!("settings.poll_hint")).size(11),
+                    ].spacing(2).width(Length::Fill),
+                    poll_pick,
+                ].align_y(iced::Alignment::Center),
+                row![
+                    text(t!("settings.auto_connect")).size(13),
+                    Space::new().width(Length::Fill),
+                    auto_connect_toggle,
+                ].align_y(iced::Alignment::Center),
+            ]
+            .spacing(8),
+        )
+        .padding(16)
+        .style(container::bordered_box)
+        .width(Length::Fill);
+
+        // ---- SCPI Server card ----
+        let scpi_toggle = button(
+            text(if self.settings.scpi.enabled { "ON" } else { "OFF" }).size(12),
+        )
+        .padding([4, 12])
+        .on_press(Message::ToggleScpiEnabled);
+
+        let scpi_port_input = text_input("5555", &self.scpi_port_input)
+            .width(Length::Fixed(80.0))
+            .on_input(Message::ScpiPortChanged)
+            .on_submit(Message::ApplyScpiPort)
+            .size(13);
+
+        let scpi_card = container(
+            column![
+                text(t!("settings.scpi_section")).size(15),
+                Space::new().height(10.0),
+                row![
+                    text(t!("settings.scpi.enable")).size(13),
+                    Space::new().width(Length::Fill),
+                    scpi_toggle,
+                ].align_y(iced::Alignment::Center),
+                row![
+                    column![
+                        text(t!("settings.scpi.port")).size(13),
+                        text(t!("settings.scpi_port_hint")).size(11),
+                    ].spacing(2).width(Length::Fill),
+                    scpi_port_input,
+                ].align_y(iced::Alignment::Center),
+            ]
+            .spacing(8),
+        )
+        .padding(16)
+        .style(container::bordered_box)
+        .width(Length::Fill);
+
+        // ---- Maintenance card ----
+        let maintenance_card = container(
+            column![
+                text(t!("settings.firmware_section")).size(15),
+                Space::new().height(10.0),
+                text(t!("settings.maintenance_desc")).size(12),
+                Space::new().height(8.0),
+                button(text(t!("btn.open_flash")).size(13))
+                    .padding([6, 14])
+                    .on_press(Message::OpenFlashPage),
+            ]
+            .spacing(4),
+        )
+        .padding(16)
+        .style(container::bordered_box)
+        .width(Length::Fill);
+
+        // ---- About card ----
+        let about_card = container(
+            column![
+                text(t!("settings.about_section")).size(15),
+                Space::new().height(10.0),
+                text(format!("{} v{}", t!("app.title"), env!("CARGO_PKG_VERSION"))).size(13),
+                row![
+                    text(t!("settings.repository")).size(13),
+                    button(text("GitHub").size(12))
+                        .padding([3, 8])
+                        .on_press(Message::OpenRepo),
+                ].spacing(6).align_y(iced::Alignment::Center),
+            ]
+            .spacing(6),
+        )
+        .padding(16)
+        .style(container::bordered_box)
+        .width(Length::Fill);
+
+        // ---- Responsive layout (two-column on wide windows) ----
+        let cards: Element<'_, Message> = if wide {
+            row![
+                column![app_card, Space::new().height(16.0), maintenance_card]
+                    .spacing(0)
+                    .width(Length::FillPortion(1)),
+                Space::new().width(20.0),
+                column![scpi_card, Space::new().height(16.0), about_card]
+                    .spacing(0)
+                    .width(Length::FillPortion(1)),
+            ]
+            .into()
+        } else {
+            column![app_card, scpi_card, maintenance_card, about_card]
+                .spacing(16)
+                .into()
+        };
+
         container(
             column![
                 text(t!("settings.title")).size(22),
-                Space::new().height(8.0),
-                row![text(t!("settings.theme")), theme_pick].spacing(10),
-                row![text(t!("settings.language")), lang_pick].spacing(10),
-                row![text(t!("settings.poll")), text(format!("{} ms", self.settings.poll_interval_ms))].spacing(10),
-                row![text(t!("settings.auto_connect")),
-                     button(text(if self.settings.auto_connect { "ON" } else { "OFF" }).size(12))
-                        .padding([4, 10])
-                        .on_press(Message::ToggleAutoConnect)].spacing(10),
+                Space::new().height(16.0),
+                cards,
                 Space::new().height(12.0),
-                text(t!("settings.scpi_section")).size(16),
-                row![text(t!("settings.scpi.enable")),
-                     text(if self.settings.scpi.enabled { "ON" } else { "OFF" })].spacing(10),
-                row![text(t!("settings.scpi.port")), text(self.settings.scpi.port.to_string())].spacing(10),
-                Space::new().height(12.0),
-                text(t!("settings.about_section")).size(16),
-                row![
-                    text(format!("{} v{}", t!("app.title"), env!("CARGO_PKG_VERSION"))).size(13),
-                ].spacing(6),
-                row![
-                    text(t!("settings.repository")).size(13),
-                    button(text("GitHub").size(12)).padding([3, 8]).on_press(Message::OpenRepo),
-                ].spacing(6).align_y(iced::Alignment::Center),
-
-                // Firmware update section
-                Space::new().height(20.0),
-                text(t!("settings.firmware_section")).size(16),
-                text(t!("settings.firmware_note")).size(12),
-                Space::new().height(4.0),
-                button(text(t!("btn.flash")).size(13)).padding([6, 16]).on_press(Message::OpenFlashPage),
-
-                // Close button
-                Space::new().height(20.0),
+                text(t!("settings.auto_saved")).size(11),
+                Space::new().height(Length::Fill),
                 button(text(t!("btn.close").to_string())).on_press(Message::CloseSettings),
             ]
-            .spacing(10)
+            .spacing(0)
             .padding(20),
         )
+        .width(Length::Fill)
+        .height(Length::Fill)
         .into()
     }
+
+    fn view_flash_confirm(&self) -> Element<'_, Message> {
+        container(
+            column![
+                text(format!("⚠ {}", t!("flash.confirm_title"))).size(18),
+                Space::new().height(12.0),
+                container(text(t!("flash.confirm_msg")).size(13))
+                    .padding(12)
+                    .style(container::bordered_box)
+                    .width(Length::Fill),
+                Space::new().height(20.0),
+                row![
+                    button(text(t!("btn.cancel").to_string()))
+                        .padding([8, 20])
+                        .on_press(Message::CancelFlashConfirm),
+                    Space::new().width(16.0),
+                    button(text(t!("btn.continue").to_string()))
+                        .padding([8, 20])
+                        .on_press(Message::ConfirmFlash),
+                ],
+            ]
+            .spacing(4)
+            .padding(30)
+            .max_width(520),
+        )
+        .center(Length::Fill)
+        .into()
+    }
+}
+
+// ---- DFU poll helper ----------------------------------------------------
+
+/// Check whether the EL15 HID device (VID:0x2e3c PID:0x5745) is reachable via
+/// USB.  The EL15 uses the same VID/PID in both normal and DFU mode, so this
+/// is a reliable proxy for "device connected via USB cable and ready for
+/// flashing".
+fn check_dfu_task() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::task::spawn_blocking(|| {
+                hidapi::HidApi::new()
+                    .ok()
+                    .map(|api| {
+                        api.device_list().any(|d| {
+                            d.vendor_id() == crate::hid_flash::EL15_VID
+                                && d.product_id() == crate::hid_flash::EL15_PID
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false)
+        },
+        Message::DfuPollResult,
+    )
 }
 
 // ---- helpers ------------------------------------------------------------
@@ -1897,6 +2229,11 @@ mod tests {
             flash_error: None,
             flash_cancel_flag: None,
             pause_poll_ticks: 0,
+            dfu_detected: false,
+            flash_confirm_path: None,
+            scpi_port_input: "5555".to_string(),
+            scpi_state: ScpiSharedState::default(),
+            scpi_server_task: None,
         }
     }
 

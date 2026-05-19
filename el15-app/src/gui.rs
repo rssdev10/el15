@@ -171,6 +171,9 @@ pub enum Message {
     DfuPollResult(bool),
     ConfirmFlash,
     CancelFlashConfirm,
+    // ---- BT watchdog / auto-reconnect ----
+    TriggerReconnect,
+    ReconnectFound(DeviceInfo),
     Noop,
 }
 
@@ -241,6 +244,16 @@ pub struct AppState {
     // ---- SCPI server (GUI mode) ----
     scpi_state: ScpiSharedState,
     scpi_server_task: Option<tokio::task::JoinHandle<()>>,
+
+    // ---- BT watchdog / connection health ----
+    /// Timestamp of the last received status packet. None until first packet or after disconnect.
+    last_data_time: Option<std::time::Instant>,
+    /// Timestamp when the last watchdog probe (init_handshake) was sent.
+    handshake_sent_at: Option<std::time::Instant>,
+    /// BLE link confirmed healthy: received ≥1 status packet since last connect.
+    bt_healthy: bool,
+    /// Auto-reconnect is pending: reconnect as soon as the current disconnect completes.
+    reconnect_pending: bool,
 }
 
 impl AppState {
@@ -284,6 +297,10 @@ impl AppState {
             scpi_port_input: settings.scpi.port.to_string(),
             scpi_state: ScpiSharedState::default(),
             scpi_server_task: None,
+            last_data_time: None,
+            handshake_sent_at: None,
+            bt_healthy: false,
+            reconnect_pending: false,
         };
 
         // If a previously connected device ID is saved, do a quick targeted scan
@@ -336,6 +353,56 @@ impl AppState {
                     return Task::none();
                 }
                 if let Some(dev) = self.device.clone() {
+                    // ---- BT watchdog -----------------------------------------------
+                    // If a probe was sent and there is still no response after 3 s,
+                    // treat the connection as dead and initiate a reconnect.
+                    if let Some(sent_at) = self.handshake_sent_at {
+                        if sent_at.elapsed() > Duration::from_secs(3) {
+                            warn!("watchdog: probe timeout — forcing reconnect");
+                            self.handshake_sent_at = None;
+                            self.bt_healthy = false;
+                            self.reconnect_pending = true;
+                            // Drop our device reference so the Arc can eventually
+                            // be fully released, then emit Disconnected to drive the
+                            // reconnect path.
+                            if let Some(owned) = self.device.take() {
+                                return Task::perform(
+                                    async move {
+                                        if let Ok(d) = Arc::try_unwrap(owned) {
+                                            let _ = d.disconnect().await;
+                                        }
+                                        Message::Disconnected
+                                    },
+                                    |m| m,
+                                );
+                            }
+                        }
+                    }
+                    // If no status packet received for 5 s and no probe is in flight,
+                    // send a handshake to check whether the device is still responsive.
+                    let since_data = self.last_data_time
+                        .map(|t| t.elapsed())
+                        .unwrap_or(Duration::from_secs(u64::MAX));
+                    if since_data > Duration::from_secs(5) && self.handshake_sent_at.is_none() {
+                        info!(
+                            "watchdog: no data for {}s — sending probe",
+                            since_data.as_secs()
+                        );
+                        self.handshake_sent_at = Some(std::time::Instant::now());
+                        // Mark link as unhealthy immediately so control buttons
+                        // are disabled while we wait for the probe response.
+                        self.bt_healthy = false;
+                        let dev2 = dev.clone();
+                        return Task::perform(
+                            async move {
+                                let _ = dev2.init_handshake().await;
+                                let _ = dev2.poll().await;
+                                Message::Noop
+                            },
+                            |m| m,
+                        );
+                    }
+                    // ----------------------------------------------------------------
                     return Task::perform(
                         async move {
                             match dev.poll().await {
@@ -434,17 +501,44 @@ impl AppState {
                 self.connecting = false;
                 self.settings.last_device_id = Some(id);
                 let _ = settings::save(&self.settings);
+                self.last_data_time = Some(std::time::Instant::now());
+                self.bt_healthy = false;
+                self.handshake_sent_at = None;
                 if let Some(d) = CONNECTED_DEVICE.get().unwrap().lock().unwrap().take() {
                     self.device = Some(d.clone());
                     let scpi_state = self.scpi_state.clone();
                     let d_scpi = d.clone();
                     tokio::spawn(async move { scpi_state.set_device(Some(d_scpi)).await; });
+                    // Pause the poll timer so the init/mode/setpoint writes below
+                    // don't race with concurrent POLL_PKT commands on the same BLE
+                    // characteristic.  SetMode uses the same mechanism for the same
+                    // reason.  4 BLE writes × ~100 ms ≤ 5 ticks × 200 ms = 1 s.
+                    self.pause_poll_ticks = 5;
                     // Re-send init handshake now that the event-forwarding chain is
                     // fully established.  The first init inside the connect task may
                     // race with the subscription setup on some BLE stacks, causing
                     // the firmware-version notification to be lost.
+                    //
+                    // Also re-send mode + setpoint: the EL15 requires these to be
+                    // set on every (re-)connection before it will accept load on/off
+                    // commands.  Without this the load button appears to do nothing
+                    // after a reconnect until the user manually clicks a mode button.
+                    let mode = self.settings.last_mode.to_proto();
+                    let setpoint = stored_setpoint(&self.settings, self.settings.last_mode);
                     return Task::perform(
-                        async move { let _ = d.init_handshake().await; Message::Noop },
+                        async move {
+                            let _ = d.init_handshake().await;
+                            // Give the device time to process the init sequence
+                            // before sending mode/setpoint.  After a power cycle
+                            // the firmware needs ~300-500 ms to become ready for
+                            // application-level commands.
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            let _ = d.send(&build_mode_cmd(mode)).await;
+                            if let Some(sp) = setpoint {
+                                let _ = d.send(&build_set_setpoint_cmd(sp)).await;
+                            }
+                            Message::Noop
+                        },
                         |m| m,
                     );
                 }
@@ -455,6 +549,12 @@ impl AppState {
                 self.last_command_ok = false;
             }
             Message::Disconnect => {
+                // User-initiated: cancel any pending auto-reconnect and clear
+                // the stale version so the status bar resets to "---".
+                self.reconnect_pending = false;
+                self.bt_healthy = false;
+                self.handshake_sent_at = None;
+                self.firmware_version = None;
                 if let Some(dev) = self.device.take() {
                     return Task::perform(
                         async move {
@@ -471,12 +571,23 @@ impl AppState {
                 info!("disconnected");
                 self.device = None;
                 self.last_status = None;
-                self.firmware_version = None;
+                // Keep firmware_version so it remains visible while reconnecting.
+                // It will be refreshed by the next successful handshake.
+                self.last_data_time = None;
+                self.bt_healthy = false;
+                self.handshake_sent_at = None;
                 let scpi_state = self.scpi_state.clone();
                 tokio::spawn(async move { scpi_state.set_device(None).await; });
+                if self.reconnect_pending {
+                    return self.update(Message::TriggerReconnect);
+                }
             }
             Message::DeviceEvent(ev) => match ev {
                 DeviceEvent::Status(st) => {
+                    // Mark link as healthy on every received status packet.
+                    self.last_data_time = Some(std::time::Instant::now());
+                    self.bt_healthy = true;
+                    self.handshake_sent_at = None;
                     let now = Local::now();
                     let resistance = if st.current.abs() > 1e-6 {
                         st.voltage / st.current
@@ -517,10 +628,26 @@ impl AppState {
                 }
                 DeviceEvent::RawNotification(_) => {}
                 DeviceEvent::Disconnected => {
+                    // If device is already None, this is a stale notification from
+                    // an old BLE connection (the watchdog or an explicit disconnect
+                    // already cleared self.device and started the reconnect path).
+                    // Ignore it — acting on it would clobber firmware_version and
+                    // start a redundant reconnect loop.
+                    if self.device.is_none() {
+                        return Task::none();
+                    }
                     info!("device pushed disconnect");
+                    // Device dropped the link unexpectedly — schedule auto-reconnect.
+                    self.reconnect_pending = true;
                     self.device = None;
                     self.last_status = None;
-                    self.firmware_version = None;
+                    // Keep firmware_version so it stays visible during reconnect.
+                    self.last_data_time = None;
+                    self.bt_healthy = false;
+                    self.handshake_sent_at = None;
+                    let scpi_state = self.scpi_state.clone();
+                    tokio::spawn(async move { scpi_state.set_device(None).await; });
+                    return self.update(Message::TriggerReconnect);
                 }
             },
             Message::SetMode(mk) => {
@@ -586,6 +713,9 @@ impl AppState {
                 info!("toggle load -> {}", if want_on {"ON"} else {"OFF"});
                 let bytes = if want_on { CMD_LOAD_ON } else { CMD_LOAD_OFF };
                 if let Some(dev) = self.device.clone() {
+                    // Pause polls so the load command doesn't race on the
+                    // same BLE characteristic (same as SetMode).
+                    self.pause_poll_ticks = 3;
                     // When turning load ON, parse text input (user may not have pressed Set)
                     let setpoint = if want_on {
                         let mode = self.settings.last_mode;
@@ -854,7 +984,11 @@ impl AppState {
                 self.chart_height = if self.chart_height > 0.0 { 0.0 } else { 160.0 };
             }
             Message::OpenRepo => {
-                let _ = open::that("https://github.com/rssdev10/el15");
+                let repo = option_env!("CARGO_PKG_REPOSITORY")
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or("https://github.com/rssdev10/el15");
+
+                let _ = open::that(repo);
             }
             Message::CapTimerToggle => {
                 self.settings.cap.timer_enabled = !self.settings.cap.timer_enabled;
@@ -938,6 +1072,34 @@ impl AppState {
                 // Restore setpoint input to stored value
                 self.setpoint_input = format_setpoint(self.settings.last_mode, &self.settings.defaults);
             }
+            Message::TriggerReconnect => {
+                if !self.reconnect_pending { return Task::none(); }
+                if self.connecting || self.device.is_some() { return Task::none(); }
+                if let Some(known_id) = self.settings.last_device_id.clone() {
+                    info!("auto-reconnect: scanning for {known_id}");
+                    return Task::perform(
+                        async move {
+                            // Brief pause so the device has time to reboot / re-advertise.
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            match scan_for_device(&known_id, Duration::from_secs(5)).await {
+                                Ok(Some(info)) => Message::ReconnectFound(info),
+                                _ => Message::TriggerReconnect, // not found — retry
+                            }
+                        },
+                        |m| m,
+                    );
+                }
+            }
+            Message::ReconnectFound(info) => {
+                if !self.reconnect_pending { return Task::none(); }
+                info!("auto-reconnect: found device {}", info.id);
+                self.devices = vec![info.clone()];
+                self.selected_device = Some(DeviceChoice {
+                    id: info.id.clone(),
+                    label: info.display_label(),
+                });
+                return self.update(Message::Connect);
+            }
             Message::Noop => {}
         }
         Task::none()
@@ -1016,8 +1178,14 @@ impl AppState {
         let load_label = if st.load_on { t!("label.load_on").to_string() } else { t!("label.load_off").to_string() };
         let conn_label = if self.connecting {
             t!("label.connecting").to_string()
+        } else if connected && !self.bt_healthy && self.handshake_sent_at.is_some() {
+            t!("label.bt_probing").to_string()
+        } else if connected && !self.bt_healthy {
+            t!("label.bt_no_data").to_string()
         } else if connected {
             t!("label.connected").to_string()
+        } else if self.reconnect_pending {
+            t!("label.reconnecting").to_string()
         } else if self.settings.auto_connect && self.devices.is_empty() {
             t!("label.searching").to_string()
         } else {
@@ -1025,9 +1193,11 @@ impl AppState {
         };
         let conn_color = if self.connecting {
             Color::from_rgb(0.85, 0.75, 0.10)
+        } else if connected && !self.bt_healthy {
+            Color::from_rgb(0.90, 0.50, 0.10) // orange — no data / probing
         } else if connected {
             COLOR_LOAD_ON
-        } else if self.settings.auto_connect && self.devices.is_empty() {
+        } else if self.reconnect_pending || (self.settings.auto_connect && self.devices.is_empty()) {
             Color::from_rgb(0.85, 0.75, 0.10)
         } else {
             COLOR_LOAD_OFF
@@ -1084,7 +1254,7 @@ impl AppState {
         ];
 
         // 3) mode/output row
-        let mode_enabled = connected && !st.load_on;
+        let mode_enabled = connected && !st.load_on && self.bt_healthy;
         let mode_buttons = row![
             mode_btn_tip("CC",  t!("tip.cc").to_string(),  ModeKind::CC,  self.settings.last_mode, mode_enabled),
             mode_btn_tip("CV",  t!("tip.cv").to_string(),  ModeKind::CV,  self.settings.last_mode, mode_enabled),
@@ -1109,7 +1279,7 @@ impl AppState {
                     border: Border { color, width: 2.0, radius: 6.0.into() },
                     ..Default::default()
                 });
-            if connected && setpoint_ok {
+            if connected && setpoint_ok && self.bt_healthy {
                 b = b.on_press(Message::ToggleLoad);
             }
             b
@@ -1317,18 +1487,48 @@ impl AppState {
         .style(container::bordered_box)
         .width(Length::Fill);
 
+        // BT health warning (shown when connected but no telemetry is arriving)
+        let bt_warning: Option<Element<'_, Message>> = if connected && !self.bt_healthy {
+            let msg = if self.reconnect_pending || self.handshake_sent_at.is_some() {
+                t!("warn.bt_reconnecting").to_string()
+            } else {
+                t!("warn.bt_no_data").to_string()
+            };
+            Some(
+                container(
+                    text(format!("⚠  {msg}")).size(13),
+                )
+                .padding([6, 12])
+                .style(|_: &Theme| iced::widget::container::Style {
+                    background: Some(Background::Color(Color::from_rgb(0.45, 0.28, 0.00))),
+                    text_color: Some(Color::from_rgb(1.0, 0.85, 0.45)),
+                    border: Border {
+                        color: Color::from_rgb(0.70, 0.45, 0.00),
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .width(Length::Fill)
+                .into(),
+            )
+        } else {
+            None
+        };
+
         container(
-            column![
-                status_bar,
-                measurement,
-                control_row,
-                chart_section,
-                samples_panel,
-                connection,
-            ]
-            .spacing(6)
-            .padding(8)
-            .height(Length::Fill),
+            {
+                let mut col = column![status_bar];
+                if let Some(w) = bt_warning { col = col.push(w); }
+                col.push(measurement)
+                    .push(control_row)
+                    .push(chart_section)
+                    .push(samples_panel)
+                    .push(connection)
+                    .spacing(6)
+                    .padding(8)
+                    .height(Length::Fill)
+            },
         )
         .height(Length::Fill)
         .into()
@@ -2234,6 +2434,10 @@ mod tests {
             scpi_port_input: "5555".to_string(),
             scpi_state: ScpiSharedState::default(),
             scpi_server_task: None,
+            last_data_time: None,
+            handshake_sent_at: None,
+            bt_healthy: false,
+            reconnect_pending: false,
         }
     }
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use el15_bt::{
     build_mode_cmd, build_set_setpoint_cmd, scan_devices, Device, DeviceEvent, Mode,
-    CMD_LOAD_OFF, CMD_LOAD_ON, CMD_LOCK, POLL_PKT,
+    CMD_LOAD_OFF, CMD_LOAD_ON, CMD_LOCK,
 };
 use el15_scpi::{ScpiServer, ScpiServerConfig, SharedState};
 use tokio_stream::StreamExt;
@@ -34,7 +34,7 @@ pub async fn run(args: Cli) -> Result<()> {
         // Flash via HID (same VID/PID stays in DFU mode; STM32 DFU is not used)
         hid_flash::hid_flash_with_progress(fw, args.verbose_flash, |progress| {
             let pct = (progress * 100.0) as u32;
-            if pct % 5 == 0 {
+            if pct.is_multiple_of(5) {
                 eprint!("\rFlashing: {}%  ", pct);
             }
             true
@@ -49,7 +49,7 @@ pub async fn run(args: Cli) -> Result<()> {
         if devices.is_empty() {
             println!("No BLE devices found.");
         } else {
-            println!("{:<3} {:<5} {:<32} {}", "EL?", "RSSI", "Name", "Id");
+            println!("{:<3} {:<5} {:<32} Id", "EL?", "RSSI", "Name");
             for d in &devices {
                 println!(
                     "{:<3} {:<5} {:<32} {}",

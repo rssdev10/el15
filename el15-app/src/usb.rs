@@ -92,8 +92,8 @@ fn speed_str(s: rusb::Speed) -> &'static str {
 }
 
 pub fn print_usb_table(devices: &[UsbInfo]) {
-    println!("{:<3} {:<3} {:>6} {:>6} {:<20} {:<20} {:<18} {:<14} {}",
-        "Bus","Adr","VID","PID","Manufacturer","Product","Serial","Speed","Tag");
+    println!("{:<3} {:<3} {:>6} {:>6} {:<20} {:<20} {:<18} {:<14} Tag",
+        "Bus","Adr","VID","PID","Manufacturer","Product","Serial","Speed");
     println!("{}", "-".repeat(120));
     for d in devices {
         let tag = if d.is_el15 {
@@ -194,7 +194,7 @@ pub fn dfu_flash_with_progress(
         sent = end;
         block_num = block_num.wrapping_add(1);
         let fraction = sent as f32 / total as f32;
-        if block_num % 16 == 0 {
+        if block_num.is_multiple_of(16) {
             info!("flashed {}/{} bytes", sent, total);
         }
         if !progress_cb(fraction) {

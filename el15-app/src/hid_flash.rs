@@ -303,9 +303,9 @@ pub fn hid_flash_with_progress(
         "firmware {} bytes: seg1={} bytes ({} chunks), seg2={} bytes ({} chunks), verify=0x{:02x}",
         atk.len(),
         parsed.seg1_data.len(),
-        (parsed.seg1_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE,
+        parsed.seg1_data.len().div_ceil(CHUNK_SIZE),
         parsed.seg2_data.len(),
-        (parsed.seg2_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE,
+        parsed.seg2_data.len().div_ceil(CHUNK_SIZE),
         parsed.verify_byte,
     );
 
@@ -313,10 +313,10 @@ pub fn hid_flash_with_progress(
         eprintln!("[flash] File: {} ({} bytes)", firmware.display(), atk.len());
         eprintln!("[flash] Seg1 header: {}", hex_str(parsed.seg1_hdr));
         eprintln!("[flash] Seg1 data: {} bytes ({} chunks)", parsed.seg1_data.len(),
-                  (parsed.seg1_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE);
+                  parsed.seg1_data.len().div_ceil(CHUNK_SIZE));
         eprintln!("[flash] Seg2 header: {}", hex_str(parsed.seg2_hdr));
         eprintln!("[flash] Seg2 data: {} bytes ({} chunks)", parsed.seg2_data.len(),
-                  (parsed.seg2_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE);
+                  parsed.seg2_data.len().div_ceil(CHUNK_SIZE));
         eprintln!("[flash] Verify byte: 0x{:02x}", parsed.verify_byte);
     }
 
@@ -392,8 +392,7 @@ pub fn hid_flash_with_progress(
 
     let mut bytes_done: usize = 0;
 
-    for seg_idx in 0..num_segs {
-        let seg = &segments[seg_idx];
+    for (seg_idx, seg) in segments[..num_segs].iter().enumerate() {
         let seg_num = seg_idx + 1;
         info!("segment {}/{}: {} bytes", seg_num, num_segs, seg.data.len());
 
@@ -429,7 +428,7 @@ pub fn hid_flash_with_progress(
         info!("segment {}: erase done", seg_num);
 
         // AF13: data chunks (addr byte cycles 0x00..0xFF, reset each segment)
-        let total_chunks = (seg.data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let total_chunks = seg.data.len().div_ceil(CHUNK_SIZE);
         for (i, chunk) in seg.data.chunks(CHUNK_SIZE).enumerate() {
             if !progress_cb((bytes_done + i * CHUNK_SIZE) as f32 / total as f32) {
                 bail!("flash cancelled by user");

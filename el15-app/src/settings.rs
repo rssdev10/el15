@@ -126,6 +126,7 @@ impl Default for DcrSettings {
 
 /// Mirrors `el15_bt::Mode` but is Serde-stable across firmware tweaks.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum ModeKind { CC, CV, CR, CP, CAP, DCR }
 
 impl ModeKind {
@@ -150,6 +151,7 @@ impl ModeKind {
             _ => return None,
         })
     }
+    #[allow(dead_code)]
     pub fn is_basic(self) -> bool {
         matches!(self, ModeKind::CC | ModeKind::CV | ModeKind::CR | ModeKind::CP)
     }

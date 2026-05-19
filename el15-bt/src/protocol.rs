@@ -200,13 +200,13 @@ fn read_i32_le(buf: &[u8]) -> i32 {
 
 /// Parse a 28-byte EL15 status notification.
 pub fn parse_status_packet(data: &[u8]) -> EL15Status {
-    let mut s = EL15Status::default();
-    s.raw_hex = data
+    let raw_hex = data
         .iter()
         .map(|b| format!("{:02X}", b))
         .collect::<Vec<_>>()
         .join(" ");
-    s.crc_pass = data.iter().fold(0u32, |a, &b| a + b as u32) & 0xFF == 0;
+    let crc_pass = data.iter().fold(0u32, |a, &b| a + b as u32) & 0xFF == 0;
+    let mut s = EL15Status { raw_hex, crc_pass, ..Default::default() };
 
     if data.len() < 28 || data[..4] != HEADER {
         return s;

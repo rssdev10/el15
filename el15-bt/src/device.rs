@@ -21,7 +21,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::{uuid, Uuid};
 
 use crate::error::{Error, Result};

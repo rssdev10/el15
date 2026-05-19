@@ -32,8 +32,6 @@ rust-i18n.workspace = true
 sys-locale.workspace = true
 
 iced.workspace = true
-plotters.workspace = true
-plotters-iced.workspace = true
 rfd.workspace = true
 
 # USB / DFU
@@ -42,7 +40,7 @@ rusb.workspace = true
 hidapi = "2"
 
 # Image loading (for window icon)
-image = { version = "0.24", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Open URLs in browser
 open = "5"

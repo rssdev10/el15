@@ -79,7 +79,7 @@
   "graph.clear": "Clear",
   "settings.scpi_section": "SCPI Server",
   "settings.firmware_section": "Firmware Update",
-  "settings.firmware_note": "Device must be in DFU mode: Settings > Others > DFU on device, or hold ⚙️ button while connecting USB.",
+  "settings.firmware_note": "Device must be in DFU mode: Settings > Others > DFU on device, or hold ⚙️ (Settings) button while connecting USB.",
   "settings.about_section": "About",
   "settings.repository": "Repository:",
   "settings.verbose_ble": "Verbose BLE",
@@ -98,7 +98,7 @@
   "flash.error": "Error",
   "flash.step_header": "Upgrade steps:",
   "flash.step_1": "1. Connect EL15 to PC via Type-C. Low power may prevent startup.",
-  "flash.step_2": "2. Enter DFU mode: on the EL15 select Settings > Others > DFU, or hold the ⚙️ button while connecting the USB cable.",
+  "flash.step_2": "2. Enter DFU mode: on the EL15 select Settings > Others > DFU, or hold the ⚙️ (Settings) button while connecting the USB cable.",
   "flash.step_3": "3. Select the firmware file and click Start Upgrade.",
   "flash.step_4": "4. Wait for the progress bar to complete.",
   "flash.step_5": "5. The device will reboot automatically, exiting upgrade mode."

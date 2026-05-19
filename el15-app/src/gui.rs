@@ -1,4 +1,4 @@
-//! iced 0.13 GUI for the EL15.
+//! iced 0.14 GUI for the EL15.
 //!
 //! Layout (top → bottom):
 //!   1. Status bar  (compact: load / BT / fan / mode / OK indicator)
@@ -72,20 +72,27 @@ pub fn run(args: Cli) -> Result<()> {
         Some(image::ImageFormat::Png),
     ).ok();
 
-    iced::application(AppState::title, AppState::update, AppState::view)
+    let win_settings = window::Settings {
+        size: Size::new(settings.window_width, settings.window_height),
+        min_size: Some(Size::new(800.0, 600.0)),
+        icon,
+        ..Default::default()
+    };
+
+    iced::application(
+        move || AppState::new(args.clone(), settings.clone()),
+        AppState::update,
+        AppState::view,
+    )
+        .title(AppState::title)
         .theme(AppState::theme)
         .subscription(AppState::subscription)
         .default_font(Font {
             family: Family::SansSerif,
             ..Font::DEFAULT
         })
-        .window(window::Settings {
-            size: Size::new(settings.window_width, settings.window_height),
-            min_size: Some(Size::new(800.0, 600.0)),
-            icon,
-            ..Default::default()
-        })
-        .run_with(move || AppState::new(args.clone(), settings.clone()))
+        .window(win_settings)
+        .run()
         .map_err(|e| anyhow::anyhow!("iced error: {e}"))
 }
 
@@ -203,6 +210,11 @@ pub struct AppState {
     flash_progress: f32,
     flash_error: Option<String>,
     flash_cancel_flag: Option<Arc<AtomicBool>>,
+
+    /// Ticks to skip poll after sending a command.  Prevents concurrent BLE
+    /// writes (poll vs command) from racing on the same characteristic, which
+    /// causes the device to silently ignore the command on some BLE stacks.
+    pause_poll_ticks: u8,
 }
 
 impl AppState {
@@ -240,6 +252,7 @@ impl AppState {
             flash_progress: 0.0,
             flash_error: None,
             flash_cancel_flag: None,
+            pause_poll_ticks: 0,
         };
 
         // If a previously connected device ID is saved, do a quick targeted scan
@@ -263,7 +276,8 @@ impl AppState {
             Task::perform(perform_scan(), Message::ScanResult)
         };
 
-        (s, startup_task)
+        let font_task = Task::none();
+        (s, Task::batch([startup_task, font_task]))
     }
 
     fn title(&self) -> String {
@@ -281,6 +295,10 @@ impl AppState {
         debug!("gui msg: {:?}", msg);
         match msg {
             Message::Tick => {
+                if self.pause_poll_ticks > 0 {
+                    self.pause_poll_ticks -= 1;
+                    return Task::none();
+                }
                 if let Some(dev) = self.device.clone() {
                     return Task::perform(
                         async move {
@@ -329,10 +347,10 @@ impl AppState {
                 }
                 self.devices = list;
                 // Auto-connect if enabled and not already connected
-                if self.settings.auto_connect && self.device.is_none() && !self.connecting {
-                    if self.selected_device.is_some() {
-                        return self.update(Message::Connect);
-                    }
+                if self.settings.auto_connect && self.device.is_none() && !self.connecting
+                    && self.selected_device.is_some()
+                {
+                    return self.update(Message::Connect);
                 }
             }
             Message::SelectDevice(choice) => {
@@ -381,7 +399,15 @@ impl AppState {
                 self.settings.last_device_id = Some(id);
                 let _ = settings::save(&self.settings);
                 if let Some(d) = CONNECTED_DEVICE.get().unwrap().lock().unwrap().take() {
-                    self.device = Some(d);
+                    self.device = Some(d.clone());
+                    // Re-send init handshake now that the event-forwarding chain is
+                    // fully established.  The first init inside the connect task may
+                    // race with the subscription setup on some BLE stacks, causing
+                    // the firmware-version notification to be lost.
+                    return Task::perform(
+                        async move { let _ = d.init_handshake().await; Message::Noop },
+                        |m| m,
+                    );
                 }
             }
             Message::ConnectFailed(e) => {
@@ -431,13 +457,18 @@ impl AppState {
                         });
                         self.graph_cache.clear();
                     }
-                    // Reflect the device-reported mode into our cached selection.
-                    if let Some(m) = ModeKind::from_proto(
-                        Mode::from_byte(st.mode_byte).unwrap_or(Mode::CC),
-                    ) {
-                        self.settings.last_mode = m;
+                    // Reflect the device-reported mode into our cached selection,
+                    // but only when no command is in-flight (pause_poll_ticks == 0).
+                    // While a mode switch is pending, keep showing the user's intent
+                    // rather than the lagging device echo.
+                    if self.pause_poll_ticks == 0 {
+                        if let Some(m) = ModeKind::from_proto(
+                            Mode::from_byte(st.mode_byte).unwrap_or(Mode::CC),
+                        ) {
+                            self.settings.last_mode = m;
+                        }
                     }
-                    self.last_command_ok = !st.warning.is_empty().then_some(false).unwrap_or(true);
+                    self.last_command_ok = st.warning.is_empty();
                     self.last_status = Some(st);
                 }
                 DeviceEvent::FirmwareVersion(ver) => {
@@ -457,6 +488,10 @@ impl AppState {
                 self.setpoint_input = format_setpoint(mk, &self.settings.defaults);
                 let _ = settings::save(&self.settings);
                 if let Some(dev) = self.device.clone() {
+                    // Hold off the poll timer while this command is in-flight so
+                    // the mode command and the concurrent poll don't race on the
+                    // same BLE characteristic (concurrent writes are often dropped).
+                    self.pause_poll_ticks = 3;
                     let mode = mk.to_proto();
                     let setpoint = stored_setpoint(&self.settings, mk);
                     return Task::perform(
@@ -538,7 +573,10 @@ impl AppState {
             }
             Message::ChangeTheme(th) => {
                 info!("theme -> {:?}", th);
-                self.settings.theme = th; let _ = settings::save(&self.settings);
+                self.settings.theme = th;
+                let _ = settings::save(&self.settings);
+                // Invalidate graph cache so grid/axis colors redraw with new theme.
+                self.graph_cache.clear();
             }
             Message::ChangeLanguage(l) => {
                 info!("language -> {l}");
@@ -548,6 +586,7 @@ impl AppState {
             Message::OpenSettings => { info!("open settings"); self.show_settings = true; }
             Message::CloseSettings => { self.show_settings = false; }
             Message::OpenFlashPage => {
+                self.show_settings = false;
                 self.show_flash_page = true;
                 self.flash_error = None;
                 self.flash_progress = 0.0;
@@ -704,7 +743,7 @@ impl AppState {
             }
             Message::ApplyGraphTimeWindow => {
                 if let Ok(secs) = self.graph_time_input.parse::<u32>() {
-                    let secs = secs.max(5).min(86400);
+                    let secs = secs.clamp(5, 86400);
                     self.settings.graph.time_window_s = secs;
                     self.graph_time_input = secs.to_string();
                     let _ = settings::save(&self.settings);
@@ -817,20 +856,15 @@ impl AppState {
         let interval = Duration::from_millis(self.settings.poll_interval_ms.max(50));
         let tick = iced::time::every(interval).map(|_| Message::Tick);
         let events = self.subscribe_to_events();
-        let win_resize = iced::event::listen_with(|event, _status, _id| {
-            if let iced::Event::Window(window::Event::Resized(size)) = event {
-                Some(Message::WindowResized(size.width, size.height))
-            } else {
-                None
-            }
+        let win_resize = window::resize_events().map(|(_id, size)| {
+            Message::WindowResized(size.width, size.height)
         });
         Subscription::batch([tick, events, win_resize])
     }
 
     fn subscribe_to_events(&self) -> Subscription<Message> {
-        Subscription::run_with_id(
-            "el15-ble-events",
-            iced::stream::channel(64, move |mut output| async move {
+        Subscription::run(|| {
+            iced::stream::channel(64, |mut output: futures::channel::mpsc::Sender<Message>| async move {
                 let rx_opt: Option<UnboundedReceiver<DeviceEvent>> = GLOBAL_RX
                     .get()
                     .and_then(|cell| cell.lock().unwrap().take());
@@ -842,8 +876,8 @@ impl AppState {
                     }
                 }
                 std::future::pending::<()>().await;
-            }),
-        )
+            })
+        })
     }
 
     // ---- view -----------------------------------------------------------
@@ -882,16 +916,16 @@ impl AppState {
                     &format!("{}: {}", t!("label.bluetooth"), &conn_label),
                     conn_color,
                 ),
-                Space::with_width(Length::Fixed(12.0)),
+                Space::new().width(12.0),
                 text(format!("{}: {}/5", t!("label.fan"), st.fan_speed)).size(13),
-                Space::with_width(Length::Fixed(12.0)),
+                Space::new().width(12.0),
                 text(format!("{}: {}", t!("label.mode"), if st.mode_name.is_empty() { "---".into() } else { st.mode_name.clone() })).size(13),
-                Space::with_width(Length::Fixed(12.0)),
+                Space::new().width(12.0),
                 text(format!("{}: {}", t!("label.dev_versions"), self.firmware_version.as_deref().unwrap_or("---"))).size(13),
-                Space::with_width(Length::Fill),
+                Space::new().width(Length::Fill),
                 indicator(if st.warning.is_empty() && self.last_command_ok { "OK" } else if !st.warning.is_empty() { st.warning.as_str() } else { "ERR" },
                     if st.warning.is_empty() && self.last_command_ok { COLOR_LOAD_ON } else { COLOR_CURRENT }),
-                Space::with_width(Length::Fixed(12.0)),
+                Space::new().width(12.0),
                 badge(
                     &load_label,
                     if st.load_on { COLOR_LOAD_ON } else { COLOR_LOAD_OFF },
@@ -915,7 +949,7 @@ impl AppState {
             ]
             .spacing(6)
             .width(Length::FillPortion(3)),
-            Space::with_width(Length::Fixed(8.0)),
+            Space::new().width(8.0),
             column![
                 container(right_panel)
                     .padding(6)
@@ -934,7 +968,7 @@ impl AppState {
             mode_btn_tip("CV",  t!("tip.cv").to_string(),  ModeKind::CV,  self.settings.last_mode, mode_enabled),
             mode_btn_tip("CR",  t!("tip.cr").to_string(),  ModeKind::CR,  self.settings.last_mode, mode_enabled),
             mode_btn_tip("CP",  t!("tip.cp").to_string(),  ModeKind::CP,  self.settings.last_mode, mode_enabled),
-            Space::with_width(Length::Fixed(20.0)),
+            Space::new().width(20.0),
             mode_btn_tip("CAP", t!("tip.cap").to_string(), ModeKind::CAP, self.settings.last_mode, mode_enabled),
             mode_btn_tip("DCR", t!("tip.dcr").to_string(), ModeKind::DCR, self.settings.last_mode, mode_enabled),
         ]
@@ -966,9 +1000,9 @@ impl AppState {
         let control_row = container(
             row![
                 mode_buttons,
-                Space::with_width(Length::Fill),
+                Space::new().width(Length::Fill),
                 // output_label,
-                // Space::with_width(Length::Fixed(10.0)),
+                // Space::new().width(10.0),
                 load_btn,
             ]
             .spacing(6)
@@ -1010,7 +1044,7 @@ impl AppState {
                 button(text(time_mode_label).size(11)).padding([2, 6]).on_press(Message::ToggleGraphTimeMode),
             ].spacing(4).align_y(iced::Alignment::Center);
             if graph_settings.time_mode == settings::GraphTimeMode::Roll {
-                time_controls = time_controls.push(Space::with_width(Length::Fixed(4.0)));
+                time_controls = time_controls.push(Space::new().width(4.0));
                 time_controls = time_controls.push(text(format!("{}:", t!("graph.time_window"))).size(11));
                 time_controls = time_controls.push(
                     text_input("60", &self.graph_time_input)
@@ -1025,7 +1059,7 @@ impl AppState {
                 );
             }
             if graph_settings.time_mode == settings::GraphTimeMode::Infinite {
-                time_controls = time_controls.push(Space::with_width(Length::Fixed(6.0)));
+                time_controls = time_controls.push(Space::new().width(6.0));
                 time_controls = time_controls.push(
                     button(text(t!("graph.clear")).size(11)).padding([2, 6]).on_press(Message::ClearGraph)
                 );
@@ -1034,11 +1068,11 @@ impl AppState {
                 v_toggle,
                 i_toggle,
                 p_toggle,
-                Space::with_width(Length::Fixed(8.0)),
+                Space::new().width(8.0),
                 button(text(layout_label).size(12)).padding([2, 8]).on_press(Message::SetGraphLayout(next_layout)),
-                Space::with_width(Length::Fixed(12.0)),
+                Space::new().width(12.0),
                 time_controls,
-                Space::with_width(Length::Fill),
+                Space::new().width(Length::Fill),
                 button(text(t!("btn.hide_chart")).size(12)).padding([2, 8]).on_press(Message::ChartToggle),
             ].spacing(4).align_y(iced::Alignment::Center);
             column![graph, resize_row].spacing(2).height(Length::Fill).into()
@@ -1049,9 +1083,9 @@ impl AppState {
                     toggle_btn("V", graph_settings.show_voltage, Message::ToggleGraphVoltage, COLOR_VOLTAGE),
                     toggle_btn("I", graph_settings.show_current, Message::ToggleGraphCurrent, COLOR_CURRENT),
                     toggle_btn("P", graph_settings.show_power, Message::ToggleGraphPower, COLOR_POWER),
-                    Space::with_width(Length::Fixed(12.0)),
+                    Space::new().width(12.0),
                     text(t!("graph.no_traces")).size(12),
-                    Space::with_width(Length::Fill),
+                    Space::new().width(Length::Fill),
                     button(text(t!("btn.hide_chart")).size(12)).padding([4, 10]).on_press(Message::ChartToggle),
                 ]
                 .spacing(4)
@@ -1066,7 +1100,7 @@ impl AppState {
             container(
                 row![
                     text(t!("label.chart_hidden")).size(12),
-                    Space::with_width(Length::Fill),
+                    Space::new().width(Length::Fill),
                     button(text(t!("btn.show_chart")).size(12)).padding([4, 10]).on_press(Message::ChartToggle),
                 ]
                 .align_y(iced::Alignment::Center),
@@ -1097,19 +1131,19 @@ impl AppState {
         let samples_panel = container(
             row![
                 text(format!("{}: {}", t!("label.samples"), self.samples.len())).size(12),
-                Space::with_width(Length::Fixed(6.0)),
+                Space::new().width(6.0),
                 if self.settings.logging_paused {
                     text("⏸").size(12)
                 } else {
                     text("⏺").size(12).color(COLOR_CURRENT)
                 },
-                Space::with_width(Length::Fixed(12.0)),
+                Space::new().width(12.0),
                 text(samples_summary(&self.samples)).size(11),
-                Space::with_width(Length::Fill),
+                Space::new().width(Length::Fill),
                 pause_btn,
-                Space::with_width(Length::Fixed(6.0)),
+                Space::new().width(6.0),
                 clear_btn,
-                Space::with_width(Length::Fixed(6.0)),
+                Space::new().width(6.0),
                 export_btn,
             ]
             .align_y(iced::Alignment::Center),
@@ -1149,9 +1183,9 @@ impl AppState {
                 device_picker,
                 button(text(t!("btn.scan")).size(12)).padding([4, 10]).on_press(Message::Scan),
                 connect_btn,
-                Space::with_width(Length::Fixed(12.0)),
+                Space::new().width(12.0),
                 conn_status,
-                Space::with_width(Length::Fill),
+                Space::new().width(Length::Fill),
                 button(text(t!("btn.settings")).size(12)).padding([4, 10]).on_press(Message::OpenSettings),
             ]
             .spacing(6)
@@ -1241,7 +1275,7 @@ impl AppState {
                         .width(Length::Fixed(100.0))
                         .size(16),
                     text(unit).size(14),
-                    Space::with_width(Length::Fill),
+                    Space::new().width(Length::Fill),
                     set_btn,
                 ]
                 .spacing(6)
@@ -1268,14 +1302,14 @@ impl AppState {
                 let mut timer_row = row![
                     text(format!("{}:", t!("label.timer"))).size(12),
                     text(timer_state).size(12),
-                    Space::with_width(Length::Fixed(8.0)),
+                    Space::new().width(8.0),
                     button(text(timer_btn_label).size(11))
                         .padding([3, 8])
                         .on_press(Message::CapTimerToggle),
                 ].spacing(6).align_y(iced::Alignment::Center);
 
                 if self.settings.cap.timer_enabled {
-                    timer_row = timer_row.push(Space::with_width(Length::Fixed(16.0)));
+                    timer_row = timer_row.push(Space::new().width(16.0));
                     timer_row = timer_row.push(text(format!("{}:", t!("label.duration"))).size(12));
                     timer_row = timer_row.push(
                         text_input("01:00:00", &self.settings.cap.timer_input)
@@ -1293,7 +1327,7 @@ impl AppState {
                 };
 
                 let has_chemistry = !self.settings.cap.chemistry.is_empty()
-                    && self.settings.cap.chemistry != t!("label.na").to_string();
+                    && self.settings.cap.chemistry != t!("label.na").as_ref();
 
                 let mut cutoff_row = row![
                     text(format!("{}:", t!("label.cutoff_v"))).size(12),
@@ -1302,7 +1336,7 @@ impl AppState {
                         .width(Length::Fixed(60.0))
                         .size(13),
                     text("V").size(12),
-                    Space::with_width(Length::Fixed(16.0)),
+                    Space::new().width(16.0),
                     text(format!("{}:", t!("label.chemistry_type"))).size(12),
                     pick_list(
                         chemistry_names(),
@@ -1314,7 +1348,7 @@ impl AppState {
                 if has_chemistry {
                     let cells_str = self.settings.cap.cells.to_string();
                     let cells_selected = Some(&cells_str);
-                    cutoff_row = cutoff_row.push(Space::with_width(Length::Fixed(12.0)));
+                    cutoff_row = cutoff_row.push(Space::new().width(12.0));
                     cutoff_row = cutoff_row.push(
                         combo_box(&self.cells_combo_state, "#", cells_selected, Message::CapCellsChanged)
                             .on_input(Message::CapCellsChanged)
@@ -1347,7 +1381,7 @@ impl AppState {
                                 .width(Length::Fixed(40.0))
                                 .size(13),
                             text("mA").size(12),
-                            Space::with_width(Length::Fixed(12.0)),
+                            Space::new().width(12.0),
                             text("I2: ").size(12),
                             text_input("1000", &self.settings.dcr.i2_input)
                                 .on_input(Message::DcrI2Changed)
@@ -1371,7 +1405,7 @@ impl AppState {
                 .width(Length::Fill)
                 .into()
             }
-            _ => Space::with_height(Length::Fixed(0.0)).into(),
+            _ => Space::new().height(0.0).into(),
         }
     }
 
@@ -1379,7 +1413,7 @@ impl AppState {
         container(
             column![
                 text(format!("⚠ {}", t!("label.confirm_title"))).size(18),
-                Space::with_height(Length::Fixed(10.0)),
+                Space::new().height(10.0),
                 text(format!(
                     "{}\n{}: {} {}",
                     t!("label.confirm_msg"),
@@ -1391,10 +1425,10 @@ impl AppState {
                         _ => "",
                     }
                 )).size(14),
-                Space::with_height(Length::Fixed(16.0)),
+                Space::new().height(16.0),
                 row![
                     button(text(t!("btn.cancel").to_string())).padding([8, 20]).on_press(Message::ConfirmCancel),
-                    Space::with_width(Length::Fixed(20.0)),
+                    Space::new().width(20.0),
                     button(text(t!("btn.confirm").to_string())).padding([8, 20]).on_press(Message::ConfirmApply),
                 ],
             ]
@@ -1463,36 +1497,36 @@ impl AppState {
         } else if self.flash_progress >= 1.0 {
             text(t!("flash.done").to_string()).size(13).color(COLOR_LOAD_ON).into()
         } else {
-            Space::with_height(Length::Fixed(0.0)).into()
+            Space::new().height(0.0).into()
         };
 
         container(
             column![
                 text(t!("flash.title")).size(20),
-                Space::with_height(Length::Fixed(12.0)),
+                Space::new().height(12.0),
                 container(text(instructions).size(13))
                     .padding(12)
                     .style(container::bordered_box)
                     .width(Length::Fill),
-                Space::with_height(Length::Fixed(16.0)),
+                Space::new().height(16.0),
                 row![
                     select_btn,
-                    Space::with_width(Length::Fixed(10.0)),
+                    Space::new().width(10.0),
                     text(firmware_label).size(13),
                 ].align_y(iced::Alignment::Center),
-                Space::with_height(Length::Fixed(8.0)),
+                Space::new().height(8.0),
                 row![
                     start_btn,
-                    Space::with_width(Length::Fixed(10.0)),
+                    Space::new().width(10.0),
                     stop_btn,
                 ].spacing(0).align_y(iced::Alignment::Center),
-                Space::with_height(Length::Fixed(12.0)),
-                progress_bar(0.0..=1.0, self.flash_progress)
-                    .height(Length::Fixed(20.0))
+                Space::new().height(12.0),
+                container(progress_bar(0.0..=1.0, self.flash_progress))
+                    .height(20)
                     .width(Length::Fill),
-                Space::with_height(Length::Fixed(6.0)),
+                Space::new().height(6.0),
                 status_text,
-                Space::with_height(Length::Fill),
+                Space::new().height(Length::Fill),
                 close_btn,
             ]
             .padding(24)
@@ -1517,7 +1551,7 @@ impl AppState {
         container(
             column![
                 text(t!("settings.title")).size(22),
-                Space::with_height(Length::Fixed(8.0)),
+                Space::new().height(8.0),
                 row![text(t!("settings.theme")), theme_pick].spacing(10),
                 row![text(t!("settings.language")), lang_pick].spacing(10),
                 row![text(t!("settings.poll")), text(format!("{} ms", self.settings.poll_interval_ms))].spacing(10),
@@ -1525,12 +1559,12 @@ impl AppState {
                      button(text(if self.settings.auto_connect { "ON" } else { "OFF" }).size(12))
                         .padding([4, 10])
                         .on_press(Message::ToggleAutoConnect)].spacing(10),
-                Space::with_height(Length::Fixed(12.0)),
+                Space::new().height(12.0),
                 text(t!("settings.scpi_section")).size(16),
                 row![text(t!("settings.scpi.enable")),
                      text(if self.settings.scpi.enabled { "ON" } else { "OFF" })].spacing(10),
                 row![text(t!("settings.scpi.port")), text(self.settings.scpi.port.to_string())].spacing(10),
-                Space::with_height(Length::Fixed(12.0)),
+                Space::new().height(12.0),
                 text(t!("settings.about_section")).size(16),
                 row![
                     text(format!("{} v{}", t!("app.title"), env!("CARGO_PKG_VERSION"))).size(13),
@@ -1541,14 +1575,14 @@ impl AppState {
                 ].spacing(6).align_y(iced::Alignment::Center),
 
                 // Firmware update section
-                // Space::with_height(Length::Fixed(20.0)),
-                // text(t!("settings.firmware_section")).size(16),
-                // text(t!("settings.firmware_note")).size(12),
-                // Space::with_height(Length::Fixed(4.0)),
-                // button(text(t!("btn.flash")).size(13)).padding([6, 16]).on_press(Message::OpenFlashPage),
+                Space::new().height(20.0),
+                text(t!("settings.firmware_section")).size(16),
+                text(t!("settings.firmware_note")).size(12),
+                Space::new().height(4.0),
+                button(text(t!("btn.flash")).size(13)).padding([6, 16]).on_press(Message::OpenFlashPage),
 
                 // Close button
-                Space::with_height(Length::Fixed(20.0)),
+                Space::new().height(20.0),
                 button(text(t!("btn.close").to_string())).on_press(Message::CloseSettings),
             ]
             .spacing(10)
@@ -1738,6 +1772,7 @@ fn stored_setpoint(settings: &Settings, mode: ModeKind) -> Option<f32> {
     }
 }
 
+/// Load platform-specific system fonts for CJK, Devanagari, and symbol fallback.
 async fn perform_scan() -> Vec<DeviceInfo> {
     match scan_devices(Some(Duration::from_secs(5))).await {
         Ok(v) => v,
@@ -1762,7 +1797,7 @@ fn chemistry_names() -> Vec<String> {
 }
 
 fn chemistry_cutoff(chem: &str, cells: u8) -> Option<f32> {
-    if chem.is_empty() || chem == t!("label.na").to_string() {
+    if chem.is_empty() || chem == t!("label.na").as_ref() {
         return None;
     }
     CHEMISTRY_TYPES
@@ -1804,3 +1839,167 @@ fn write_csv(path: &std::path::Path, samples: &[Sample]) -> Result<()> {
 static GLOBAL_TX: OnceLock<UnboundedSender<DeviceEvent>> = OnceLock::new();
 static GLOBAL_RX: OnceLock<StdMutex<Option<UnboundedReceiver<DeviceEvent>>>> = OnceLock::new();
 static CONNECTED_DEVICE: OnceLock<StdMutex<Option<Arc<Device>>>> = OnceLock::new();
+
+// ---- tests --------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+
+    /// Build a minimal AppState for testing without BLE or global statics.
+    fn test_state() -> AppState {
+        let settings = Settings::default();
+        let setpoint_default = format_setpoint(settings.last_mode, &settings.defaults);
+        let time_window_str = settings.graph.time_window_s.to_string();
+        AppState {
+            args: Cli {
+                no_gui: false,
+                verbose: 0,
+                verbose_ble: false,
+                verbose_gui: false,
+                log: None,
+                port: 5555,
+                no_scpi: false,
+                scan: false,
+                device: None,
+                list_usb: false,
+                flash: None,
+                verbose_flash: false,
+                dfu_probe: false,
+                debug: false,
+                usb_vid: None,
+                usb_pid: None,
+            },
+            settings: settings.clone(),
+            devices: vec![],
+            selected_device: None,
+            device: None,
+            connecting: false,
+            last_status: None,
+            samples: VecDeque::with_capacity(MAX_SAMPLES),
+            setpoint_input: setpoint_default,
+            last_command_ok: true,
+            show_settings: false,
+            show_confirm: false,
+            flashing: false,
+            firmware_version: None,
+            graph_cache: Cache::new(),
+            chart_height: 160.0,
+            graph_time_input: time_window_str,
+            graph_start_time: None,
+            cells_combo_state: combo_box::State::new(
+                (1u8..=20).map(|n| n.to_string()).collect(),
+            ),
+            show_flash_page: false,
+            flash_firmware_path: None,
+            flash_progress: 0.0,
+            flash_error: None,
+            flash_cancel_flag: None,
+            pause_poll_ticks: 0,
+        }
+    }
+
+    #[test]
+    fn open_settings_sets_flag() {
+        let mut state = test_state();
+        assert!(!state.show_settings);
+        let _ = state.update(Message::OpenSettings);
+        assert!(state.show_settings);
+    }
+
+    #[test]
+    fn close_settings_clears_flag() {
+        let mut state = test_state();
+        state.show_settings = true;
+        let _ = state.update(Message::CloseSettings);
+        assert!(!state.show_settings);
+    }
+
+    #[test]
+    fn open_flash_page_closes_settings() {
+        let mut state = test_state();
+        state.show_settings = true;
+        let _ = state.update(Message::OpenFlashPage);
+        assert!(state.show_flash_page);
+        assert!(!state.show_settings);
+    }
+
+    #[test]
+    fn setpoint_changed_updates_input() {
+        let mut state = test_state();
+        let _ = state.update(Message::SetpointChanged("5.123".to_string()));
+        assert_eq!(state.setpoint_input, "5.123");
+    }
+
+    #[test]
+    fn set_mode_changes_mode_and_setpoint() {
+        let mut state = test_state();
+        let _ = state.update(Message::SetMode(ModeKind::CV));
+        assert_eq!(state.settings.last_mode, ModeKind::CV);
+        // Should format the default CV setpoint
+        let expected = format!("{:.3}", state.settings.defaults.cv_volts);
+        assert_eq!(state.setpoint_input, expected);
+    }
+
+    #[test]
+    fn toggle_graph_traces() {
+        let mut state = test_state();
+        let before = state.settings.graph.show_voltage;
+        let _ = state.update(Message::ToggleGraphVoltage);
+        assert_ne!(state.settings.graph.show_voltage, before);
+    }
+
+    #[test]
+    fn change_theme() {
+        let mut state = test_state();
+        let _ = state.update(Message::ChangeTheme(AppTheme::Light));
+        assert_eq!(state.settings.theme, AppTheme::Light);
+        let _ = state.update(Message::ChangeTheme(AppTheme::Dark));
+        assert_eq!(state.settings.theme, AppTheme::Dark);
+    }
+
+    #[test]
+    fn window_resized_updates_settings() {
+        let mut state = test_state();
+        let _ = state.update(Message::WindowResized(1024.0, 768.0));
+        assert_eq!(state.settings.window_width, 1024.0);
+        assert_eq!(state.settings.window_height, 768.0);
+    }
+
+    #[test]
+    fn clear_samples_empties_deque() {
+        let mut state = test_state();
+        state.samples.push_back(Sample {
+            when: Local::now(),
+            voltage: 12.0,
+            current: 1.0,
+            power: 12.0,
+            resistance: 12.0,
+            temperature: 25.0,
+            runtime_s: 0,
+            mode: "CC".to_string(),
+            load_on: true,
+        });
+        assert!(!state.samples.is_empty());
+        let _ = state.update(Message::ClearSamples);
+        assert!(state.samples.is_empty());
+    }
+
+    #[test]
+    fn graph_layout_cycle() {
+        let mut state = test_state();
+        let _ = state.update(Message::SetGraphLayout(GraphLayout::SplitVertical));
+        assert_eq!(state.settings.graph.layout, GraphLayout::SplitVertical);
+        let _ = state.update(Message::SetGraphLayout(GraphLayout::SplitHorizontal));
+        assert_eq!(state.settings.graph.layout, GraphLayout::SplitHorizontal);
+    }
+
+    #[test]
+    fn clamp_setpoint_respects_ranges() {
+        assert_eq!(clamp_setpoint(ModeKind::CC, 15.0), 12.0);
+        assert_eq!(clamp_setpoint(ModeKind::CC, -1.0), 0.0);
+        assert_eq!(clamp_setpoint(ModeKind::CV, 0.05), 0.1);
+        assert_eq!(clamp_setpoint(ModeKind::CV, 100.0), 60.0);
+    }
+}

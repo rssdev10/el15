@@ -34,13 +34,11 @@ const MIN_P_RANGE: f32 = 1.0;
 
 const GRID_LINES: usize = 4;
 
-const BG_COLOR: Color = Color::from_rgb(0.12, 0.12, 0.14);
-const GRID_COLOR: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.10);
-const AXIS_COLOR: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.55);
 
 const SUB_GAP: f32 = 4.0;
 
 /// Build the graph panel element with configurable layout and trace visibility.
+#[allow(clippy::too_many_arguments)]
 pub fn view_configurable<'a>(
     samples: &'a VecDeque<Sample>,
     cache: &'a Cache,
@@ -95,40 +93,59 @@ impl<'a> canvas::Program<Message> for GraphCanvas<'a> {
         &self,
         _state: &Self::State,
         renderer: &iced::Renderer,
-        _theme: &Theme,
+        theme: &Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
+        let bg = theme.palette().background;
+        let is_dark = (bg.r + bg.g + bg.b) / 3.0 < 0.5;
+
+        // Background is drawn outside the cache so theme changes are reflected
+        // immediately without waiting for a cache invalidation.
+        let mut bg_frame = Frame::new(renderer, bounds.size());
+        bg_frame.fill_rectangle(Point::ORIGIN, bounds.size(), bg);
+        let background = bg_frame.into_geometry();
+
         let geom = self.cache.draw(renderer, bounds.size(), |frame| {
-            self.render(frame, bounds.size());
+            self.render(frame, bounds.size(), is_dark);
         });
-        vec![geom]
+        vec![background, geom]
     }
 }
 
 impl<'a> GraphCanvas<'a> {
-    fn render(&self, frame: &mut Frame, size: Size) {
-        frame.fill_rectangle(Point::ORIGIN, size, BG_COLOR);
+    fn render(&self, frame: &mut Frame, size: Size, is_dark: bool) {
+        // Background is handled by the caller (drawn outside the cache).
+        let grid_color = if is_dark {
+            Color::from_rgba(1.0, 1.0, 1.0, 0.10)
+        } else {
+            Color::from_rgba(0.0, 0.0, 0.0, 0.15)
+        };
+        let axis_color = if is_dark {
+            Color::from_rgba(1.0, 1.0, 1.0, 0.55)
+        } else {
+            Color::from_rgba(0.0, 0.0, 0.0, 0.55)
+        };
 
         let visible = get_visible(self.samples, self.time_mode, self.time_window_s, self.graph_start_time);
         if visible.is_empty() {
-            draw_no_data(frame, size);
+            draw_no_data(frame, size, axis_color);
             return;
         }
 
         match self.layout {
-            GraphLayout::Combined => self.render_combined(frame, size, &visible),
-            GraphLayout::SplitVertical => self.render_split_vertical(frame, size, &visible),
-            GraphLayout::SplitHorizontal => self.render_split_horizontal(frame, size, &visible),
+            GraphLayout::Combined => self.render_combined(frame, size, &visible, grid_color, axis_color),
+            GraphLayout::SplitVertical => self.render_split_vertical(frame, size, &visible, grid_color, axis_color),
+            GraphLayout::SplitHorizontal => self.render_split_horizontal(frame, size, &visible, grid_color, axis_color),
         }
     }
 
-    fn render_combined(&self, frame: &mut Frame, size: Size, visible: &[&Sample]) {
+    fn render_combined(&self, frame: &mut Frame, size: Size, visible: &[&Sample], grid_color: Color, axis_color: Color) {
         let graph_w = (size.width - MARGIN_LEFT - MARGIN_RIGHT).max(1.0);
         let graph_h = (size.height - MARGIN_TOP - MARGIN_BOTTOM).max(1.0);
         let n = visible.len();
 
-        draw_grid(frame, MARGIN_LEFT, MARGIN_TOP, graph_w, graph_h);
+        draw_grid(frame, MARGIN_LEFT, MARGIN_TOP, graph_w, graph_h, grid_color, axis_color);
 
         // Count how many right-side axes we need to place
         let mut right_axis_index: usize = 0;
@@ -163,7 +180,7 @@ impl<'a> GraphCanvas<'a> {
         draw_legend(frame, size, self.show_voltage, self.show_current, self.show_power);
     }
 
-    fn render_split_vertical(&self, frame: &mut Frame, size: Size, visible: &[&Sample]) {
+    fn render_split_vertical(&self, frame: &mut Frame, size: Size, visible: &[&Sample], grid_color: Color, axis_color: Color) {
         let traces = self.active_traces();
         if traces.is_empty() { return; }
 
@@ -176,7 +193,7 @@ impl<'a> GraphCanvas<'a> {
             let inner_h = (sub_h - MARGIN_TOP - MARGIN_BOTTOM).max(1.0);
             let n = visible.len();
 
-            draw_grid(frame, MARGIN_LEFT, y_off + MARGIN_TOP, graph_w, inner_h);
+            draw_grid(frame, MARGIN_LEFT, y_off + MARGIN_TOP, graph_w, inner_h, grid_color, axis_color);
 
             let (value_fn, min_range, color): (fn(&Sample) -> f32, f32, Color) = match trace {
                 TraceKind::Voltage => (|s| s.voltage, MIN_V_RANGE, COLOR_VOLTAGE),
@@ -191,7 +208,7 @@ impl<'a> GraphCanvas<'a> {
         }
     }
 
-    fn render_split_horizontal(&self, frame: &mut Frame, size: Size, visible: &[&Sample]) {
+    fn render_split_horizontal(&self, frame: &mut Frame, size: Size, visible: &[&Sample], grid_color: Color, axis_color: Color) {
         let traces = self.active_traces();
         if traces.is_empty() { return; }
 
@@ -206,7 +223,7 @@ impl<'a> GraphCanvas<'a> {
             let graph_h = (size.height - MARGIN_TOP - MARGIN_BOTTOM).max(1.0);
             let n = visible.len();
 
-            draw_grid(frame, x_off + margin_l, MARGIN_TOP, graph_w, graph_h);
+            draw_grid(frame, x_off + margin_l, MARGIN_TOP, graph_w, graph_h, grid_color, axis_color);
 
             let (value_fn, min_range, color): (fn(&Sample) -> f32, f32, Color) = match trace {
                 TraceKind::Voltage => (|s| s.voltage, MIN_V_RANGE, COLOR_VOLTAGE),
@@ -247,12 +264,12 @@ impl TraceKind {
 
 // ---- Shared drawing helpers ---------------------------------------------
 
-fn get_visible<'a>(
-    samples: &'a VecDeque<Sample>,
+fn get_visible(
+    samples: &VecDeque<Sample>,
     time_mode: GraphTimeMode,
     time_window_s: u32,
     graph_start_time: Option<DateTime<Local>>,
-) -> Vec<&'a Sample> {
+) -> Vec<&Sample> {
     let filtered: Vec<&Sample> = match time_mode {
         GraphTimeMode::Roll => {
             let cutoff = Local::now() - chrono::Duration::seconds(time_window_s as i64);
@@ -274,18 +291,18 @@ fn get_visible<'a>(
     }
 }
 
-fn draw_no_data(frame: &mut Frame, size: Size) {
+fn draw_no_data(frame: &mut Frame, size: Size, axis_color: Color) {
     frame.fill_text(canvas::Text {
         content: "Waiting for data…".into(),
         position: Point::new(size.width / 2.0 - 60.0, size.height / 2.0),
-        color: AXIS_COLOR,
+        color: axis_color,
         size: 14.0.into(),
         ..Default::default()
     });
 }
 
-fn draw_grid(frame: &mut Frame, x_off: f32, y_off: f32, graph_w: f32, graph_h: f32) {
-    let stroke = Stroke::default().with_color(GRID_COLOR).with_width(0.5);
+fn draw_grid(frame: &mut Frame, x_off: f32, y_off: f32, graph_w: f32, graph_h: f32, grid_color: Color, axis_color: Color) {
+    let stroke = Stroke::default().with_color(grid_color).with_width(0.5);
     for i in 0..=GRID_LINES {
         let frac = i as f32 / GRID_LINES as f32;
         let y = y_off + frac * graph_h;
@@ -305,7 +322,7 @@ fn draw_grid(frame: &mut Frame, x_off: f32, y_off: f32, graph_w: f32, graph_h: f
         Point::new(x_off, y_off),
         Size::new(graph_w, graph_h),
     );
-    frame.stroke(&border, Stroke::default().with_color(AXIS_COLOR).with_width(1.0));
+    frame.stroke(&border, Stroke::default().with_color(axis_color).with_width(1.0));
 }
 
 fn draw_y_axis(frame: &mut Frame, x_off: f32, y_off: f32, graph_h: f32, min: f32, max: f32, color: Color) {
@@ -315,14 +332,16 @@ fn draw_y_axis(frame: &mut Frame, x_off: f32, y_off: f32, graph_h: f32, min: f32
         let y = y_off + frac * graph_h;
         frame.fill_text(canvas::Text {
             content: format!("{:.2}", val),
-            position: Point::new(x_off - 45.0, y - 6.0),
+            position: Point::new(x_off - 10.0, y - 6.0),
             color,
             size: 10.0.into(),
+            align_x: iced::alignment::Horizontal::Right.into(),
             ..Default::default()
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_y_axis_right(frame: &mut Frame, x_off: f32, y_off: f32, graph_h: f32, min: f32, max: f32, color: Color, index: usize) {
     let offset = 4.0 + index as f32 * 50.0;
     for i in 0..=GRID_LINES {
@@ -349,6 +368,7 @@ fn draw_trace_label(frame: &mut Frame, x: f32, y: f32, label: &str, color: Color
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_trace(
     frame: &mut Frame,
     visible: &[&Sample],

@@ -48,6 +48,10 @@ cargo run --release -p el15-app -- --no-gui --port 5555 -v
 cargo run --release -p scpi-test -- --port 5555
 ```
 
+## GUI
+
+![image](docs/el15_gui.png)
+
 ## Documentation
 
 - [docs/BT_PROTOCOL.md](docs/BT_PROTOCOL.md) — BLE wire protocol

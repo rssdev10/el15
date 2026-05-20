@@ -1271,7 +1271,13 @@ impl AppState {
             let label = if on { t!("btn.disable_load").to_string() } else { t!("btn.enable_load").to_string() };
             let color = if on { COLOR_LOAD_ON } else { Color::from_rgb(0.85, 0.55, 0.10) };
             let setpoint_ok = on || is_setpoint_valid(&self.setpoint_input, self.settings.last_mode);
-            let mut b = button(text(label).size(14).color(Color::WHITE))
+            let mut b = button(
+                    row![
+                        text(label).size(14).color(Color::WHITE),
+                        Space::new().width(6.0),
+                        text("⏻").size(18),
+                    ].align_y(iced::Alignment::Center)
+                )
                 .padding([8, 18])
                 .style(move |_, _| iced::widget::button::Style {
                     background: Some(Background::Color(color)),
@@ -1405,7 +1411,13 @@ impl AppState {
 
         // 6) samples panel
         let export_btn = {
-            let mut b = button(text(t!("btn.export")).size(12)).padding([4, 10]);
+            let mut b = button(
+                row![
+                    text(t!("btn.export")).size(12),
+                    Space::new().width(5.0),
+                    text("📄").size(15)
+                ].align_y(iced::Alignment::Center).height(15)
+            ).padding([4, 10]);
             if !self.samples.is_empty() {
                 b = b.on_press(Message::Export);
             }
@@ -1435,7 +1447,7 @@ impl AppState {
                 pause_btn,
                 Space::new().width(6.0),
                 clear_btn,
-                Space::new().width(6.0),
+                Space::new().width(15.0),
                 export_btn,
             ]
             .align_y(iced::Alignment::Center),
@@ -1478,7 +1490,15 @@ impl AppState {
                 Space::new().width(12.0),
                 conn_status,
                 Space::new().width(Length::Fill),
-                button(text(t!("btn.settings")).size(12)).padding([4, 10]).on_press(Message::OpenSettings),
+                button(
+                    row![
+                        text(t!("btn.settings")).size(12),
+                        Space::new().width(5.0),
+                        text("⛭").size(15)
+                    ].align_y(iced::Alignment::Center).height(15)
+                )
+                .padding([4, 10])
+                .on_press(Message::OpenSettings),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
@@ -1999,7 +2019,11 @@ impl AppState {
         // ---- Maintenance card ----
         let maintenance_card = container(
             column![
-                text(t!("settings.firmware_section")).size(15),
+                row![
+                    text(t!("settings.firmware_section")).size(15),
+                    Space::new().width(10.0),
+                    text("🛠️").size(20),
+                ].align_y(iced::Alignment::Center),
                 Space::new().height(10.0),
                 text(t!("settings.maintenance_desc")).size(12),
                 Space::new().height(8.0),
@@ -2016,7 +2040,11 @@ impl AppState {
         // ---- About card ----
         let about_card = container(
             column![
-                text(t!("settings.about_section")).size(15),
+                row![
+                    text(t!("settings.about_section")).size(15), 
+                    Space::new().width(10.0), 
+                    text("ⓘ").size(20)
+                ].align_y(iced::Alignment::Center),
                 Space::new().height(10.0),
                 text(format!("{} v{}", t!("app.title"), env!("CARGO_PKG_VERSION"))).size(13),
                 row![

@@ -79,7 +79,7 @@
   "graph.split_h": "Разд. ↔",
   "graph.no_traces": "Нет активных графиков",
   "graph.roll": "Прокрутка",
-  "graph.infinite": "Полный",
+  "graph.infinite": "Полностью",
   "graph.time_window": "Окно",
   "graph.clear": "Очистить",
   "settings.scpi_section": "Сервер SCPI",

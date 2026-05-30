@@ -256,6 +256,20 @@ pub struct AppState {
     reconnect_pending: bool,
 }
 
+
+/// Wrapper for language display in pick_list
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LangOption {
+    code: String,
+    display: String,
+}
+
+impl std::fmt::Display for LangOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display)
+    }
+}
+
 impl AppState {
     fn new(args: Cli, settings: Settings) -> (Self, Task<Message>) {
         let setpoint_default = format_setpoint(settings.last_mode, &settings.defaults);
@@ -1930,10 +1944,22 @@ impl AppState {
             Some(self.settings.theme),
             Message::ChangeTheme,
         );
+        let lang_display_names = crate::i18n::language_display_names();
+        let lang_options: Vec<LangOption> = lang_display_names
+            .iter()
+            .map(|(code, display)| LangOption {
+                code: code.clone(),
+                display: display.clone(),
+            })
+            .collect();
+        let current_lang = lang_options
+            .iter()
+            .find(|o| o.code == self.settings.language)
+            .cloned();
         let lang_pick = pick_list(
-            i18n::LANGUAGES.iter().map(|(c, _)| c.to_string()).collect::<Vec<_>>(),
-            Some(self.settings.language.clone()),
-            Message::ChangeLanguage,
+            lang_options,
+            current_lang,
+            |opt: LangOption| Message::ChangeLanguage(opt.code),
         );
         let poll_options: Vec<u64> = vec![50, 100, 200, 500, 1000, 2000];
         let poll_pick = pick_list(

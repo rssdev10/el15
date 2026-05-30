@@ -6,14 +6,39 @@
 
 pub use rust_i18n::t;
 
+
 pub fn set_language(lang: &str) {
     rust_i18n::set_locale(lang);
 }
 
-pub const LANGUAGES: &[(&str, &str)] = &[
-    ("en", "English"),
-    ("ru", "Русский"),
-    ("zh", "中文"),
-    ("es", "Español"),
-    ("hi", "हिन्दी"),
+pub const LANGUAGES: &[(&str, &str, &str)] = &[
+    ("en", "English", "English"),
+    ("ru", "Русский", "Russian"),
+    ("es", "Español", "Spanish"),
+    ("zh", "中文", "Chinese"),
+    ("hi", "हिन्दी", "Hindi"),
 ];
+
+/// Returns display names for the language selector, including native names.
+/// e.g. "Russian (Русский)", "English (English)"
+pub fn language_display_names() -> Vec<(String, String)> {
+    LANGUAGES
+        .iter()
+        .map(|(code, native, english)| {
+            (code.to_string(), format!("{} ({})", english, native))
+        })
+        .collect()
+}
+
+/// Detect the system locale and return a matching supported language code,
+/// falling back to "en" if none matches.
+pub fn detect_system_language() -> String {
+    if let Some(locale) = sys_locale::get_locale() {
+        // locale is like "en-US", "ru-RU", "zh-CN", "hi-IN", etc.
+        let lang = locale.split(['-', '_']).next().unwrap_or("en");
+        if LANGUAGES.iter().any(|(code, _, _)| *code == lang) {
+            return lang.to_string();
+        }
+    }
+    "en".into()
+}

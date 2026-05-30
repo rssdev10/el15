@@ -4,20 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::i18n::LANGUAGES;
-
-/// Detect the system locale and return a matching supported language code,
-/// falling back to "en" if none matches.
-fn detect_system_language() -> String {
-    if let Some(locale) = sys_locale::get_locale() {
-        // locale is like "en-US", "ru-RU", "zh-CN", "hi-IN", etc.
-        let lang = locale.split(['-', '_']).next().unwrap_or("en");
-        if LANGUAGES.iter().any(|(code, _)| *code == lang) {
-            return lang.to_string();
-        }
-    }
-    "en".into()
-}
+use crate::i18n;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -178,7 +165,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: Theme::Dark,
-            language: detect_system_language(),
+            language: i18n::detect_system_language(),
             poll_interval_ms: 200,
             auto_connect: true,
             logging_paused: false,

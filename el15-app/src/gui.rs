@@ -245,6 +245,13 @@ pub struct AppState {
     scpi_state: ScpiSharedState,
     scpi_server_task: Option<tokio::task::JoinHandle<()>>,
 
+    // ---- Mode-switch guard ----
+    /// When set, a mode-switch command is in-flight.  While active, status
+    /// packets do not overwrite `settings.last_mode` and mode buttons are
+    /// disabled.  Cleared when a status packet confirms the new mode, or
+    /// after a 10-second timeout.
+    pending_mode_switch: Option<(ModeKind, std::time::Instant)>,
+
     // ---- BT watchdog / connection health ----
     /// Timestamp of the last received status packet. None until first packet or after disconnect.
     last_data_time: Option<std::time::Instant>,
@@ -311,6 +318,7 @@ impl AppState {
             scpi_port_input: settings.scpi.port.to_string(),
             scpi_state: ScpiSharedState::default(),
             scpi_server_task: None,
+            pending_mode_switch: None,
             last_data_time: None,
             handshake_sent_at: None,
             bt_healthy: false,
@@ -362,6 +370,48 @@ impl AppState {
         debug!("gui msg: {:?}", msg);
         match msg {
             Message::Tick => {
+                // ---- Mode-switch timeout & retry guard --------------------------
+                if let Some((target, started)) = self.pending_mode_switch {
+                    let elapsed = started.elapsed();
+                    if elapsed > Duration::from_secs(10) {
+                        warn!(
+                            "mode switch to {:?} timed out after 10s — reverting",
+                            target
+                        );
+                        self.pending_mode_switch = None;
+                        self.last_command_ok = false;
+                        // Next status packet will set the real mode from device.
+                    } else if elapsed > Duration::from_millis(1500)
+                        && self.pause_poll_ticks == 0
+                    {
+                        // The device hasn't confirmed the mode yet and the initial
+                        // write window has passed.  Re-send the mode command every
+                        // ~2 s in case the BLE write was silently dropped.
+                        let secs = elapsed.as_millis();
+                        // Fire at 1.5s, 3.5s, 5.5s, 7.5s (every 2s after initial 1.5s)
+                        let tick_ms = self.settings.poll_interval_ms as u128;
+                        let bucket = (secs - 1500) / 2000;
+                        let bucket_start = 1500 + bucket * 2000;
+                        if secs >= bucket_start && secs < bucket_start + tick_ms {
+                            if let Some(dev) = self.device.clone() {
+                                info!("retrying mode switch to {:?} (elapsed {}ms)", target, secs);
+                                self.pause_poll_ticks = 3;
+                                let mode = target.to_proto();
+                                let setpoint = stored_setpoint(&self.settings, target);
+                                return Task::perform(
+                                    async move {
+                                        let _ = dev.send(&build_mode_cmd(mode)).await;
+                                        if let Some(sp) = setpoint {
+                                            let _ = dev.send(&build_set_setpoint_cmd(sp)).await;
+                                        }
+                                        Message::Noop
+                                    },
+                                    |m| m,
+                                );
+                            }
+                        }
+                    }
+                }
                 if self.pause_poll_ticks > 0 {
                     self.pause_poll_ticks -= 1;
                     return Task::none();
@@ -590,6 +640,7 @@ impl AppState {
                 self.last_data_time = None;
                 self.bt_healthy = false;
                 self.handshake_sent_at = None;
+                self.pending_mode_switch = None;
                 let scpi_state = self.scpi_state.clone();
                 tokio::spawn(async move { scpi_state.set_device(None).await; });
                 if self.reconnect_pending {
@@ -623,15 +674,24 @@ impl AppState {
                         });
                         self.graph_cache.clear();
                     }
-                    // Reflect the device-reported mode into our cached selection,
-                    // but only when no command is in-flight (pause_poll_ticks == 0).
-                    // While a mode switch is pending, keep showing the user's intent
-                    // rather than the lagging device echo.
-                    if self.pause_poll_ticks == 0 {
-                        if let Some(m) = ModeKind::from_proto(
-                            Mode::from_byte(st.mode_byte).unwrap_or(Mode::CC),
-                        ) {
-                            self.settings.last_mode = m;
+                    // Reflect the device-reported mode into our cached selection.
+                    // When a mode-switch command is in-flight, only accept the
+                    // mode field if it matches the target (confirmation).  While
+                    // pending, stale/lagging mode reports are ignored to prevent
+                    // the UI from reverting prematurely.
+                    if let Some(device_mode) = ModeKind::from_proto(
+                        Mode::from_byte(st.mode_byte).unwrap_or(Mode::CC),
+                    ) {
+                        if let Some((target, _)) = self.pending_mode_switch {
+                            if device_mode == target {
+                                // Device confirmed the new mode.
+                                info!("mode switch to {:?} confirmed by device", target);
+                                self.pending_mode_switch = None;
+                                self.settings.last_mode = device_mode;
+                            }
+                            // else: stale packet with old mode — ignore
+                        } else if self.pause_poll_ticks == 0 {
+                            self.settings.last_mode = device_mode;
                         }
                     }
                     self.last_command_ok = st.warning.is_empty();
@@ -670,6 +730,9 @@ impl AppState {
                 self.setpoint_input = format_setpoint(mk, &self.settings.defaults);
                 let _ = settings::save(&self.settings);
                 if let Some(dev) = self.device.clone() {
+                    // Mark mode switch as pending — status packets will not
+                    // override last_mode until the device confirms or timeout.
+                    self.pending_mode_switch = Some((mk, std::time::Instant::now()));
                     // Hold off the poll timer while this command is in-flight so
                     // the mode command and the concurrent poll don't race on the
                     // same BLE characteristic (concurrent writes are often dropped).
@@ -730,6 +793,14 @@ impl AppState {
                     // Pause polls so the load command doesn't race on the
                     // same BLE characteristic (same as SetMode).
                     self.pause_poll_ticks = 3;
+                    // When turning load ON, re-send mode + setpoint to ensure
+                    // the device uses the user-selected mode (guards against
+                    // a lost earlier mode command).
+                    let mode_cmd = if want_on {
+                        Some(build_mode_cmd(self.settings.last_mode.to_proto()))
+                    } else {
+                        None
+                    };
                     // When turning load ON, parse text input (user may not have pressed Set)
                     let setpoint = if want_on {
                         let mode = self.settings.last_mode;
@@ -746,6 +817,9 @@ impl AppState {
                     };
                     return Task::perform(
                         async move {
+                            if let Some(cmd) = mode_cmd {
+                                let _ = dev.send(&cmd).await;
+                            }
                             if let Some(sp) = setpoint {
                                 let _ = dev.send(&build_set_setpoint_cmd(sp)).await;
                             }
@@ -1268,7 +1342,8 @@ impl AppState {
         ];
 
         // 3) mode/output row
-        let mode_enabled = connected && !st.load_on && self.bt_healthy;
+        let mode_enabled = connected && !st.load_on && self.bt_healthy
+            && self.pending_mode_switch.is_none();
         let mode_buttons = row![
             mode_btn_tip("CC",  t!("tip.cc").to_string(),  ModeKind::CC,  self.settings.last_mode, mode_enabled),
             mode_btn_tip("CV",  t!("tip.cv").to_string(),  ModeKind::CV,  self.settings.last_mode, mode_enabled),
@@ -1299,7 +1374,7 @@ impl AppState {
                     border: Border { color, width: 2.0, radius: 6.0.into() },
                     ..Default::default()
                 });
-            if connected && setpoint_ok && self.bt_healthy {
+            if connected && setpoint_ok && self.bt_healthy && self.pending_mode_switch.is_none() {
                 b = b.on_press(Message::ToggleLoad);
             }
             b
@@ -1614,22 +1689,28 @@ impl AppState {
             ModeKind::DCR => (t!("label.current").to_string(),        "mA", "20–12000"),
         };
         let valid = is_setpoint_valid(&self.setpoint_input, mode);
-        let border_color = if valid { Color::from_rgb(0.4, 0.4, 0.4) } else { Color::from_rgb(0.9, 0.2, 0.2) };
+        let pending = self.pending_mode_switch.is_some();
+        let border_color = if valid || pending { Color::from_rgb(0.4, 0.4, 0.4) } else { Color::from_rgb(0.9, 0.2, 0.2) };
 
         let mut set_btn = button(text(t!("btn.set").to_string()).size(12)).padding([4, 10]);
-        if valid {
+        if valid && !pending {
             set_btn = set_btn.on_press(Message::ApplySetpoint);
+        }
+
+        let mut input = text_input("0.0", &self.setpoint_input)
+            .width(Length::Fixed(100.0))
+            .size(16);
+        if !pending {
+            input = input
+                .on_input(Message::SetpointChanged)
+                .on_submit(Message::ApplySetpoint);
         }
 
         container(
             column![
                 text(format!("{} ({})", label, hint)).size(11),
                 row![
-                    text_input("0.0", &self.setpoint_input)
-                        .on_input(Message::SetpointChanged)
-                        .on_submit(Message::ApplySetpoint)
-                        .width(Length::Fixed(100.0))
-                        .size(16),
+                    input,
                     text(unit).size(14),
                     Space::new().width(Length::Fill),
                     set_btn,
@@ -1649,6 +1730,11 @@ impl AppState {
     }
 
     fn battery_params_panel(&self) -> Element<'_, Message> {
+        // Don't show mode-specific parameters until the device confirms the
+        // mode switch.  This prevents editing settings that aren't active yet.
+        if self.pending_mode_switch.is_some() {
+            return Space::new().height(0.0).into();
+        }
         match self.settings.last_mode {
             ModeKind::CAP => {
                 let timer_btn_label = if self.settings.cap.timer_enabled { t!("btn.disable").to_string() } else { t!("btn.enable").to_string() };
@@ -2488,6 +2574,7 @@ mod tests {
             scpi_port_input: "5555".to_string(),
             scpi_state: ScpiSharedState::default(),
             scpi_server_task: None,
+            pending_mode_switch: None,
             last_data_time: None,
             handshake_sent_at: None,
             bt_healthy: false,
@@ -2596,5 +2683,48 @@ mod tests {
         assert_eq!(clamp_setpoint(ModeKind::CC, -1.0), 0.0);
         assert_eq!(clamp_setpoint(ModeKind::CV, 0.05), 0.1);
         assert_eq!(clamp_setpoint(ModeKind::CV, 100.0), 60.0);
+    }
+
+    #[test]
+    fn pending_mode_switch_blocks_status_override() {
+        let mut state = test_state();
+        // Simulate user clicking CP while device is in CC.
+        let _ = state.update(Message::SetMode(ModeKind::CP));
+        assert_eq!(state.settings.last_mode, ModeKind::CP);
+        // No device connected, so pending_mode_switch is not set (no BLE send).
+        // Simulate with device by manually setting pending.
+        state.pending_mode_switch = Some((ModeKind::CP, std::time::Instant::now()));
+
+        // Incoming status packet still reports CC — should be ignored.
+        let mut st = EL15Status::default();
+        st.valid = true;
+        st.mode_byte = 0x01; // CC
+        st.mode_name = "CC".to_string();
+        let _ = state.update(Message::DeviceEvent(DeviceEvent::Status(st.clone())));
+        // Mode must remain CP (not overridden by status).
+        assert_eq!(state.settings.last_mode, ModeKind::CP);
+        assert!(state.pending_mode_switch.is_some());
+
+        // Now device confirms CP mode.
+        st.mode_byte = 0x19; // CP
+        st.mode_name = "CP".to_string();
+        let _ = state.update(Message::DeviceEvent(DeviceEvent::Status(st)));
+        // Pending should be cleared.
+        assert!(state.pending_mode_switch.is_none());
+        assert_eq!(state.settings.last_mode, ModeKind::CP);
+    }
+
+    #[test]
+    fn pending_mode_switch_timeout_clears() {
+        let mut state = test_state();
+        // Set pending mode switch with an already-expired timestamp.
+        state.pending_mode_switch = Some((
+            ModeKind::CP,
+            std::time::Instant::now() - Duration::from_secs(11),
+        ));
+        // Tick should detect the timeout and clear pending.
+        let _ = state.update(Message::Tick);
+        assert!(state.pending_mode_switch.is_none());
+        assert!(!state.last_command_ok);
     }
 }

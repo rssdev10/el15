@@ -343,7 +343,7 @@ fn draw_y_axis(frame: &mut Frame, x_off: f32, y_off: f32, graph_h: f32, min: f32
 
 #[allow(clippy::too_many_arguments)]
 fn draw_y_axis_right(frame: &mut Frame, x_off: f32, y_off: f32, graph_h: f32, min: f32, max: f32, color: Color, index: usize) {
-    let offset = 4.0 + index as f32 * 50.0;
+    let offset = 4.0 + index as f32 * 30.0;
     for i in 0..=GRID_LINES {
         let frac = i as f32 / GRID_LINES as f32;
         let val = max - frac * (max - min);

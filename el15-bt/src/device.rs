@@ -124,7 +124,7 @@ pub async fn scan_for_device(target_id: &str, timeout: Duration) -> Result<Optio
     central.start_scan(filter).await?;
 
     let target = target_id.to_string();
-    let found = tokio::time::timeout(timeout, async move {
+    let found = tokio::time::timeout(timeout, async {
         while let Some(event) = events.next().await {
             let id = match &event {
                 CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => id.clone(),
@@ -150,11 +150,13 @@ pub async fn scan_for_device(target_id: &str, timeout: Duration) -> Result<Optio
         }
         None
     })
-    .await
-    .ok()
-    .flatten();
+    .await;
 
-    Ok(found)
+    // Always stop the scan: whether the device was found, the
+    // timeout fired, or the future was cancelled mid-flight.
+    let _ = central.stop_scan().await;
+
+    Ok(found.ok().flatten())
 }
 
 pub async fn scan_devices_with(opts: ScanOptions) -> Result<Vec<DeviceInfo>> {
@@ -178,38 +180,45 @@ pub async fn scan_devices_with(opts: ScanOptions) -> Result<Vec<DeviceInfo>> {
         ScanFilter::default()
     };
     central.start_scan(filter).await?;
-    tokio::time::sleep(opts.duration).await;
+
+    let result = async {
+        tokio::time::sleep(opts.duration).await;
+        let mut out = Vec::new();
+        for p in central.peripherals().await? {
+            let props = p.properties().await?.unwrap_or_default();
+            let name = props.local_name.clone().unwrap_or_default();
+            let advertises_el15 = props.services.contains(&EL15_SERVICE_UUID);
+            let name_match = !name.is_empty()
+                && NAME_PREFIXES
+                    .iter()
+                    .any(|pfx| name.to_uppercase().starts_with(&pfx.to_uppercase()));
+            let is_el15 = advertises_el15 || name_match;
+
+            if opts.only_el15 && !is_el15 {
+                continue;
+            }
+
+            let addr = props.address.to_string();
+            out.push(DeviceInfo {
+                id: p.id().to_string(),
+                name: if name.is_empty() {
+                    "(unnamed)".into()
+                } else {
+                    name
+                },
+                address: addr,
+                rssi: props.rssi,
+                is_el15,
+                peripheral: p,
+            });
+        }
+        Ok::<_, Error>(out)
+    }
+    .await;
+
     let _ = central.stop_scan().await;
 
-    let mut out = Vec::new();
-    for p in central.peripherals().await? {
-        let props = p.properties().await?.unwrap_or_default();
-        let name = props.local_name.clone().unwrap_or_default();
-        let advertises_el15 = props.services.contains(&EL15_SERVICE_UUID);
-        let name_match = !name.is_empty()
-            && NAME_PREFIXES
-                .iter()
-                .any(|pfx| name.to_uppercase().starts_with(&pfx.to_uppercase()));
-        let is_el15 = advertises_el15 || name_match;
-
-        if opts.only_el15 && !is_el15 {
-            continue;
-        }
-
-        let addr = props.address.to_string();
-        out.push(DeviceInfo {
-            id: p.id().to_string(),
-            name: if name.is_empty() {
-                "(unnamed)".into()
-            } else {
-                name
-            },
-            address: addr,
-            rssi: props.rssi,
-            is_el15,
-            peripheral: p,
-        });
-    }
+    let mut out = result?;
     out.sort_by(|a, b| {
         b.is_el15
             .cmp(&a.is_el15)
@@ -230,11 +239,32 @@ pub struct Device {
 }
 
 impl Device {
+    /// Connect to an EL15 device.
+    ///
+    /// On success returns a [`Device`] handle and a stream of [`DeviceEvent`]s.
+    /// If any step after `p.connect()` fails, the BLE connection is torn down
+    /// before returning the error (best-effort — on cancellation during an
+    /// await point the peripheral handle is dropped and the platform layer
+    /// typically cleans up).
     pub async fn connect(info: &DeviceInfo) -> Result<(Self, ReceiverStream<DeviceEvent>)> {
         let p = info.peripheral.clone();
-        if !p.is_connected().await? {
+        let was_disconnected = !p.is_connected().await?;
+        if was_disconnected {
             p.connect().await?;
         }
+
+        match Self::build_device(p.clone()).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                if was_disconnected {
+                    let _ = p.disconnect().await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn build_device(p: Peripheral) -> Result<(Self, ReceiverStream<DeviceEvent>)> {
         p.discover_services().await?;
 
         let mut write_char = None;

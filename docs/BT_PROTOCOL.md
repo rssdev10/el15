@@ -45,6 +45,34 @@ a valid checksum, the device responds with error code `0x06` in the ACK.
 
 Implementation: `el15_bt::checksum(data: &[u8]) -> u8`.
 
+## Command pacing (required)
+
+The write characteristic advertises WRITE_WITHOUT_RESPONSE, and `Device::send`
+uses it. That has **no flow control**: commands written back-to-back are
+silently dropped, with no error reported to the host.
+
+Leave at least **120 ms** between consecutive commands
+(`el15_bt::INTER_COMMAND_GAP`). Use `Device::send_sequence()` for any burst
+rather than consecutive `send()` calls.
+
+Measured on HW:2.0 / SW:1.7 — three commands (set mode, set setpoint, set CAP
+current) sent with no gap:
+
+```
+>> af 07 03 03 01 02 41        set mode CAP
+>> af 07 03 04 04 …            set setpoint      (no gap)
+>> af 07 03 09 01 04 39        load on           (no gap)
+<< df 07 03 03 01 00 13        ACK for the mode command only
+<< df 01 04 39 01 02 e0        malformed — contains 04 39 from the outgoing frame
+```
+
+The CAP current read back **unchanged 3 times out of 3**; spaced 120 ms apart
+the identical sequence took effect 3 times out of 3. Symptomatically this looks
+like a UI that needs several button presses before a command "takes".
+
+The poll timer must also be held off for the duration of a burst, otherwise the
+periodic poll becomes one more back-to-back write (`AppState::pause_ticks_for`).
+
 ## Connection Handshake
 
 After BLE connection and characteristic subscription, the host **must** send
@@ -194,14 +222,97 @@ The `el15-bt` library emits these events from the notification stream:
 | ---------------------------- | ----------------------------------------------------- |
 | `Status(EL15Status)`         | Any 28-byte notification with header `DF 07 03 08`    |
 | `FirmwareVersion(String)`    | Init response with header `DF FF FF`; parsed by `parse_firmware_version` |
+| `CapCurrent(f32)`            | CAP discharge-current reply `DF 07 03 0A 04 <f32>`, in Amps |
 | `RawNotification(Vec<u8>)`   | Every notification, unfiltered (for debugging)        |
 | `Disconnected`               | GATT notification stream ends                         |
 
+### CAP discharge current (cmd `0x05` write / `0x0A` read)
+
+The capacity-test discharge current has its **own opcode** — the ordinary
+`set setpoint` (`0x04`) does not reach it.
+
+| Direction | Bytes                                    |
+| --------- | ---------------------------------------- |
+| Write     | `AF 07 03 05 04 <f32 LE amps> <csum>`   |
+| Read      | `AF 07 03 0A 00 3D`                     |
+| Response  | `DF 07 03 0A 04 <f32 LE amps> <csum>`   |
+
+Verified end-to-end on HW:2.0 / SW:1.7:
+
+```
+>> af 07 03 0a 00 3d                       read
+<< df 07 03 0a 04 00 00 a0 40 29           5.0 A  (device showed 5000 mA)
+>> af 07 03 05 04 00 00 00 40 fe           write 2.0 A
+<< df 07 03 05 01 00 11                    ACK, status 00
+>> af 07 03 0a 00 3d                       read
+<< df 07 03 0a 04 04 00 00 40 c5           2.0 A  (device showed 2000 mA)
+```
+
+Range is `0 – 12000 mA` (manual §3.4.1). The value is in **Amps**, not
+milliamps. The device stores milliamps internally, so a value written as `5.0`
+reads back as `5.0000010` — never compare the readback for exact equality.
+
+The current is **not** carried in the status packet: in CAP mode bytes 23..27
+hold the measured capacity. `0x0A` is the only way to observe it. The register
+is global — it reads the same in CC, CAP and DCR mode.
+
+### Command map
+
+Every opcode in `AF 07 03 <cmd> <len> …` was probed on real hardware. `len = 0`
+means *read*, `len > 0` means *write*.
+
+| cmd    | Read (`len=0`)          | Write            | Meaning                          |
+| ------ | ----------------------- | ---------------- | -------------------------------- |
+| `0x00` | code `03`               | code `03`        | invalid                          |
+| `0x01` | code `00`               | —                | accepted, no observed effect     |
+| `0x02` | 3 bytes `00 11 14`      | —                | **unidentified** (constant)      |
+| `0x03` | —                       | `len=1` mode     | set mode                         |
+| `0x04` | —                       | `len=4` f32      | set setpoint (CC/CV/CR/CP only)  |
+| `0x05` | code `04`               | `len=4` f32 A    | **set CAP discharge current**    |
+| `0x06` | code `04`               | rejects len 1–8  | **unidentified**                 |
+| `0x07` | device name             | —                | info                             |
+| `0x08` | 28-byte status          | —                | poll                             |
+| `0x09` | —                       | `len=1`          | load on / off / lock             |
+| `0x0A` | 4 bytes f32 A           | code `04`        | **read CAP discharge current**   |
+| `0x0B`+| code `05`               | —                | unknown                          |
+
+Acknowledgement status byte (`DF 07 03 <cmd> 01 <status>`):
+
+| Status | Meaning                                  |
+| ------ | ---------------------------------------- |
+| `0x00` | accepted                                 |
+| `0x03` | invalid command                          |
+| `0x04` | command exists, wrong payload length     |
+| `0x05` | unknown command                          |
+
 ## Operational notes
 
-- **CAP mode** uses the discharge current stored in device memory (set via
-  front panel or previous session). The `set setpoint` command does not affect
-  CAP discharge current.
+- **CAP cutoff voltage and timer are not available over BLE.** Every opcode was
+  probed; none reads or writes them. They are front-panel settings (manual
+  §3.4.2 "CAP Params") and the protocol has no equivalent. The app must not
+  present them as device controls — see `docs/GUI_DESIGN.md`.
+- **`set setpoint` is silently ignored in CAP and DCR.** Sending
+  `AF 07 03 04 04 <f32>` while in CAP mode is acknowledged with
+  `DF 07 03 04 01 00 12` — status `00`, identical to the CC-mode
+  acknowledgement — but changes neither the discharge current nor the cutoff.
+  Use `0x05` for the CAP discharge current.
+- **An ACK is not proof of effect.** The status byte reports that the frame was
+  well-formed, not that it altered anything. Confirm against a readback
+  (`0x0A`) or the device display before concluding a command works.
+- **Reference capture caveat.** `logs/series_1/btsnoop_hci.log` contains only
+  six command types, because its CAP step was recorded with factory defaults
+  (`logs/series_1/protocol.md`, step 9: "Send CAP. Default values."). Absence
+  from that capture does not mean a command does not exist — `0x05` and `0x0A`
+  are both absent from it and both work.
+- **Grepping the capture:** filter on the write handle, not the payload prefix.
+  Commands go to handle `0x0009`, notifications arrive on `0x0006`. A 28-byte
+  status notification fragments as 20+8 on Android, and the 8-byte tail can
+  begin with `AF` by coincidence, which looks exactly like a command.
+- **Characteristics:** the official Android app writes to `FFF3` and subscribes
+  to `FFF2`. This client uses `FFF1` for both, which the device also accepts —
+  `Device::connect` picks the first writable/notifying characteristic on the
+  `FFF0` service rather than a fixed UUID. No command has been found that works
+  on one characteristic but not the other.
 - **DCR mode** auto-stops after measurement completes. The `dcr_mohm` field
   reports resistance in **Ohms** (not milliohms despite the field name).
 - **Android BLE MTU:** On Android, 28-byte status notifications may arrive

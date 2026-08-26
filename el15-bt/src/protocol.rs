@@ -29,7 +29,27 @@ pub const CMD_LOCK: [u8; 7]     = [0xAF, 0x07, 0x03, 0x09, 0x01, 0x01, 0x3C];
 const CMD_MODE_PREFIX: [u8; 5] = [0xAF, 0x07, 0x03, 0x03, 0x01];
 
 /// Prefix of a "set setpoint" command — append the f32 LE bytes + checksum.
+///
+/// Applies to CC/CV/CR/CP only. In CAP and DCR the device acknowledges this
+/// command with status `0x00` and then ignores it — use [`CMD_SET_CAP_CURRENT_PREFIX`]
+/// for the CAP discharge current.
 const CMD_SETPOINT_PREFIX: [u8; 5] = [0xAF, 0x07, 0x03, 0x04, 0x04];
+
+/// Prefix of a "set CAP discharge current" command (cmd `0x05`, f32 LE Amps).
+///
+/// Separate opcode from the ordinary setpoint. Verified on HW:2.0 / SW:1.7:
+/// writing here changes the value that [`CMD_GET_CAP_CURRENT`] reads back and
+/// the current shown on the device's capacity-test screen.
+const CMD_SET_CAP_CURRENT_PREFIX: [u8; 5] = [0xAF, 0x07, 0x03, 0x05, 0x04];
+
+/// Read the CAP discharge current — device replies `DF 07 03 0A 04 <f32 LE>`.
+///
+/// The device applies its own quantisation (it stores milliamps), so a value
+/// written as `5.0` reads back as `5.0000010`.
+pub const CMD_GET_CAP_CURRENT: [u8; 6] = [0xAF, 0x07, 0x03, 0x0A, 0x00, 0x3D];
+
+/// Header of the CAP discharge-current response.
+pub const CAP_CURRENT_HEADER: [u8; 5] = [0xDF, 0x07, 0x03, 0x0A, 0x04];
 
 /// Compute the checksum byte that makes `sum(packet) % 256 == 0`.
 pub fn checksum(data: &[u8]) -> u8 {
@@ -316,6 +336,31 @@ pub fn build_set_setpoint_cmd(value: f32) -> Vec<u8> {
     v
 }
 
+/// Highest CAP discharge current the device accepts (12 A = 12000 mA).
+pub const CAP_CURRENT_MAX_A: f32 = 12.0;
+
+/// Build a "set CAP discharge current" command (`0x05`), value in **Amps**.
+///
+/// The value is clamped to the device's documented `0 – 12000 mA` range.
+pub fn build_set_cap_current_cmd(amps: f32) -> Vec<u8> {
+    let amps = amps.clamp(0.0, CAP_CURRENT_MAX_A);
+    let mut v = Vec::with_capacity(10);
+    v.extend_from_slice(&CMD_SET_CAP_CURRENT_PREFIX);
+    v.extend_from_slice(&amps.to_le_bytes());
+    v.push(checksum(&v));
+    v
+}
+
+/// Parse a CAP discharge-current response (`DF 07 03 0A 04 <f32 LE> <csum>`).
+///
+/// Returns the current in Amps, or `None` if this is not that response.
+pub fn parse_cap_current(data: &[u8]) -> Option<f32> {
+    if data.len() < 10 || data[..5] != CAP_CURRENT_HEADER {
+        return None;
+    }
+    Some(f32::from_le_bytes([data[5], data[6], data[7], data[8]]))
+}
+
 /// Parse the firmware version from the Init response notification.
 ///
 /// Packet: `DF FF FF <status> <hw_ver> <b1> <b2> <sw_ver>` (8 bytes).
@@ -374,6 +419,58 @@ mod tests {
         let f = f32::from_le_bytes([cmd[5], cmd[6], cmd[7], cmd[8]]);
         assert!((f - 2.5).abs() < 1e-6);
         assert_eq!(cmd.iter().fold(0u8, |a, &b| a.wrapping_add(b)), 0);
+    }
+
+    /// Byte-for-byte against the frame accepted by the real device
+    /// (HW:2.0 / SW:1.7): `af 07 03 05 04 00 00 a0 40 5e` set 5.0 A and the
+    /// device acknowledged it with `df 07 03 05 01 00 11`.
+    #[test]
+    fn build_set_cap_current_matches_device_accepted_frame() {
+        assert_eq!(
+            build_set_cap_current_cmd(5.0),
+            vec![0xAF, 0x07, 0x03, 0x05, 0x04, 0x00, 0x00, 0xA0, 0x40, 0x5E]
+        );
+        assert_eq!(
+            build_set_cap_current_cmd(3.3),
+            vec![0xAF, 0x07, 0x03, 0x05, 0x04, 0x33, 0x33, 0x53, 0x40, 0x45]
+        );
+    }
+
+    #[test]
+    fn cap_current_is_clamped_to_device_range() {
+        let hi = build_set_cap_current_cmd(99.0);
+        assert_eq!(f32::from_le_bytes([hi[5], hi[6], hi[7], hi[8]]), CAP_CURRENT_MAX_A);
+        let lo = build_set_cap_current_cmd(-1.0);
+        assert_eq!(f32::from_le_bytes([lo[5], lo[6], lo[7], lo[8]]), 0.0);
+        assert_eq!(hi.iter().fold(0u8, |a, &b| a.wrapping_add(b)), 0);
+    }
+
+    #[test]
+    fn cap_current_read_command_checksum() {
+        assert_eq!(CMD_GET_CAP_CURRENT, [0xAF, 0x07, 0x03, 0x0A, 0x00, 0x3D]);
+        assert_eq!(
+            CMD_GET_CAP_CURRENT.iter().fold(0u8, |a, &b| a.wrapping_add(b)),
+            0
+        );
+    }
+
+    /// Real response captured from the device with its current set to 5000 mA.
+    /// Note the device quantises to milliamps, so 5.0 comes back as 5.0000010 —
+    /// readback must not be compared for exact equality.
+    #[test]
+    fn parse_cap_current_from_device_response() {
+        let resp = [0xDF, 0x07, 0x03, 0x0A, 0x04, 0x02, 0x00, 0xA0, 0x40, 0x27];
+        let amps = parse_cap_current(&resp).expect("should parse");
+        assert!((amps - 5.0).abs() < 1e-4, "got {amps}");
+    }
+
+    #[test]
+    fn parse_cap_current_rejects_other_packets() {
+        // Status packet header — must not be mistaken for a CAP current reply.
+        assert!(parse_cap_current(&[0xDF, 0x07, 0x03, 0x08, 0x16, 0, 0, 0, 0, 0]).is_none());
+        // Acknowledgement of the set command, not the read reply.
+        assert!(parse_cap_current(&[0xDF, 0x07, 0x03, 0x05, 0x01, 0x00, 0x11]).is_none());
+        assert!(parse_cap_current(&[]).is_none());
     }
 
     #[test]

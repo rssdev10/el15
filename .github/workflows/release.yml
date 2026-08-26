@@ -1,14 +1,33 @@
 name: build and release
 
 on:
-  release:
-    types: [ created, published ]
-
+  # Exactly one build per release, driven by the tag push.
+  #
+  # There is deliberately no `release:` trigger.  Creating a release on a new
+  # tag also pushes that tag, so having both fires two runs for one release —
+  # and `types: [created, published]` fired twice again on its own, because
+  # publishing a non-draft release emits both events.
+  #
+  # Pushing a tag builds every platform and attaches the artifacts to a *draft*
+  # release.  Publishing that draft does not rebuild: nothing here listens for
+  # it, and the binaries are already attached.
+  #
+  # Note `release: created` could not have covered the draft case anyway —
+  # GitHub does not trigger workflows for the created/edited/deleted activity
+  # types on draft releases, and a draft has no git tag until it is published.
   push:
     tags:
       - 'v*'
 
+  # Manual builds for sharing test binaries; uploaded as workflow artifacts
+  # rather than to a release.
   workflow_dispatch:
+
+# One run per tag.  Queues rather than cancels: these runs upload release
+# assets, so killing one mid-upload would leave the release incomplete.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -17,8 +36,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Create the draft release once, before the matrix fans out.  Four parallel
+  # jobs each calling action-gh-release on a tag with no existing release would
+  # race to create it; with this job they only ever add assets to it.
+  create-release:
+    name: create draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+
   build:
     name: build (${{ matrix.platform.label }}-${{ matrix.platform.arch }})
+    needs: [create-release]
+    # Still build on workflow_dispatch, where create-release is skipped.
+    if: ${{ !cancelled() && needs.create-release.result != 'failure' }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -115,7 +149,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         env:
-          APP_VERSION: ${{ github.event.release.tag_name || github.ref_name }}
+          APP_VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           rm -rf dist && mkdir -p dist
@@ -152,7 +186,7 @@ jobs:
           (Get-FileHash "dist/${{ matrix.platform.archive }}" -Algorithm SHA256).Hash.ToLower() | Set-Content "dist/${{ matrix.platform.archive }}.sha256"
 
       - name: Release artifacts (non-mac)
-        if: github.event_name == 'release' && runner.os != 'macOS'
+        if: startsWith(github.ref, 'refs/tags/') && runner.os != 'macOS'
         uses: softprops/action-gh-release@v3
         with:
           files: |
@@ -160,7 +194,7 @@ jobs:
             dist/${{ matrix.platform.archive }}.sha256
 
       - name: Release artifacts (mac)
-        if: github.event_name == 'release' && runner.os == 'macOS'
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
         uses: softprops/action-gh-release@v3
         with:
           files: |

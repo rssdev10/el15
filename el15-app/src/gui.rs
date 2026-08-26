@@ -40,7 +40,10 @@ use crate::cli::Cli;
 use crate::i18n::{self, t};
 use crate::settings::{self, GraphLayout, GraphTimeMode, ModeKind, Settings, Theme as AppTheme};
 
-const MAX_SAMPLES: usize = 7200;
+/// Initial allocation for the shared sample buffer.  The buffer may grow to
+/// `settings::sample_capacity()`, which at a long retention is far larger than
+/// most sessions need — preallocating that up front would waste tens of MB.
+const SAMPLES_PREALLOC: usize = 8_192;
 
 // ---- colors (EL15 device palette) ---------------------------------------
 pub const COLOR_VOLTAGE: Color = Color::from_rgb(0.20, 0.85, 0.35); // green
@@ -60,7 +63,11 @@ pub struct Sample {
     pub resistance: f32,
     pub temperature: f32,
     pub runtime_s: u32,
-    pub mode: String,
+    /// Mode name as reported by the device.  `Arc<str>` rather than `String`:
+    /// the buffer now holds hundreds of thousands of samples and the mode name
+    /// is identical across nearly all of them, so consecutive samples share one
+    /// allocation instead of allocating on every status packet.
+    pub mode: Arc<str>,
     pub load_on: bool,
 }
 
@@ -157,6 +164,8 @@ pub enum Message {
     ToggleGraphTimeMode,
     GraphTimeWindowChanged(String),
     ApplyGraphTimeWindow,
+    GraphRetentionChanged(String),
+    ApplyGraphRetention,
     ClearGraph,
     WindowResized(f32, f32),
     OpenRepo,
@@ -217,6 +226,10 @@ pub struct AppState {
     graph_cache: Cache,
     chart_height: f32,
     graph_time_input: String,
+    graph_retention_input: String,
+    /// Epoch set by the graph's **Clear** button: samples older than this are
+    /// hidden from the graph but kept in the buffer for CSV export.  Set here
+    /// and nowhere else, so nothing but Clear can hide recorded data.
     graph_start_time: Option<DateTime<Local>>,
     cells_combo_state: combo_box::State<String>,
 
@@ -281,6 +294,7 @@ impl AppState {
     fn new(args: Cli, settings: Settings) -> (Self, Task<Message>) {
         let setpoint_default = format_setpoint(settings.last_mode, &settings.defaults);
         let time_window_str = settings.graph.time_window_s.to_string();
+        let retention_str = settings.graph.history_retention_s.to_string();
         // Initialize the global event channel + device slot.
         let (tx, rx) = unbounded_channel();
         let _ = GLOBAL_TX.set(tx);
@@ -295,7 +309,7 @@ impl AppState {
             device: None,
             connecting: false,
             last_status: None,
-            samples: VecDeque::with_capacity(MAX_SAMPLES),
+            samples: VecDeque::with_capacity(SAMPLES_PREALLOC),
             setpoint_input: setpoint_default,
             last_command_ok: true,
             show_settings: false,
@@ -305,6 +319,7 @@ impl AppState {
             graph_cache: Cache::new(),
             chart_height: 160.0,
             graph_time_input: time_window_str,
+            graph_retention_input: retention_str,
             graph_start_time: None,
             cells_combo_state: combo_box::State::new((1u8..=20).map(|n| n.to_string()).collect()),
             show_flash_page: false,
@@ -359,6 +374,40 @@ impl AppState {
         format!("{} v{}", t!("app.title"), env!("CARGO_PKG_VERSION"))
     }
 
+    /// Upper bound on the shared sample buffer at the current poll rate.
+    fn sample_capacity(&self) -> usize {
+        settings::sample_capacity(
+            self.settings.poll_interval_ms,
+            self.settings.graph.history_retention_s,
+        )
+    }
+
+    /// Drop samples that have aged out of the retention window, so the buffer
+    /// stays bounded before the next sample is appended.
+    ///
+    /// This is the *only* place samples expire on their own.  Retention bounds
+    /// the graph and CSV export together: the two read the same buffer, so the
+    /// graph can never show something an export would miss, or vice versa.
+    fn trim_samples(&mut self, now: DateTime<Local>) {
+        let cutoff = now - chrono::Duration::seconds(self.settings.graph.history_retention_s as i64);
+        while self.samples.front().is_some_and(|s| s.when < cutoff) {
+            self.samples.pop_front();
+        }
+        // Memory backstop, in case the device reports faster than the poll rate.
+        let cap = self.sample_capacity();
+        while self.samples.len() >= cap {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Wall-clock span currently held in the buffer, in seconds.
+    fn buffered_span_s(&self) -> i64 {
+        match (self.samples.front(), self.samples.back()) {
+            (Some(first), Some(last)) => (last.when - first.when).num_seconds().max(0),
+            _ => 0,
+        }
+    }
+
     fn theme(&self) -> Theme {
         match self.settings.theme {
             AppTheme::Light => Theme::Light,
@@ -370,6 +419,12 @@ impl AppState {
         debug!("gui msg: {:?}", msg);
         match msg {
             Message::Tick => {
+                // Roll's time domain is anchored to "now", so the window has to
+                // keep scrolling even while no samples are arriving.  Infinite's
+                // domain is the data itself and only changes when data does.
+                if self.settings.graph.time_mode == GraphTimeMode::Roll {
+                    self.graph_cache.clear();
+                }
                 // ---- Mode-switch timeout & retry guard --------------------------
                 if let Some((target, started)) = self.pending_mode_switch {
                     let elapsed = started.elapsed();
@@ -660,7 +715,13 @@ impl AppState {
                         f32::INFINITY
                     };
                     if !self.settings.logging_paused {
-                        if self.samples.len() == MAX_SAMPLES { self.samples.pop_front(); }
+                        self.trim_samples(now);
+                        // Reuse the previous sample's mode allocation — the name
+                        // only changes on an actual mode switch.
+                        let mode = match self.samples.back() {
+                            Some(prev) if *prev.mode == *st.mode_name => Arc::clone(&prev.mode),
+                            _ => Arc::from(st.mode_name.as_str()),
+                        };
                         self.samples.push_back(Sample {
                             when: now,
                             voltage: st.voltage,
@@ -669,7 +730,7 @@ impl AppState {
                             resistance,
                             temperature: st.temperature,
                             runtime_s: st.runtime_s,
-                            mode: st.mode_name.clone(),
+                            mode,
                             load_on: st.load_on,
                         });
                         self.graph_cache.clear();
@@ -969,6 +1030,9 @@ impl AppState {
             Message::ExportDone(Err(e)) => warn!("CSV export failed: {e}"),
             Message::ClearSamples => {
                 self.samples.clear();
+                // The buffer is gone, so a view epoch into it is meaningless —
+                // drop it rather than let it outlive the data it referred to.
+                self.graph_start_time = None;
                 self.graph_cache.clear();
             }
             Message::ToggleAutoConnect => {
@@ -1040,6 +1104,8 @@ impl AppState {
                 self.graph_cache.clear();
             }
             Message::ToggleGraphTimeMode => {
+                // Deliberately a view-only switch: it must never touch
+                // `self.samples`, so toggling mid-run cannot lose data.
                 self.settings.graph.time_mode = match self.settings.graph.time_mode {
                     GraphTimeMode::Roll => GraphTimeMode::Infinite,
                     GraphTimeMode::Infinite => GraphTimeMode::Roll,
@@ -1052,14 +1118,39 @@ impl AppState {
             }
             Message::ApplyGraphTimeWindow => {
                 if let Ok(secs) = self.graph_time_input.parse::<u32>() {
-                    let secs = secs.clamp(5, 86400);
+                    // A window wider than retention can never be filled, so
+                    // clamp to what the buffer can actually hold.
+                    let max_window = self.settings.graph.history_retention_s.max(5);
+                    let secs = secs.clamp(5, max_window);
                     self.settings.graph.time_window_s = secs;
                     self.graph_time_input = secs.to_string();
                     let _ = settings::save(&self.settings);
                     self.graph_cache.clear();
                 }
             }
+            Message::GraphRetentionChanged(v) => {
+                self.graph_retention_input = v;
+            }
+            Message::ApplyGraphRetention => {
+                if let Ok(secs) = self.graph_retention_input.parse::<u32>() {
+                    let secs = secs.clamp(60, 86_400);
+                    self.settings.graph.history_retention_s = secs;
+                    self.graph_retention_input = secs.to_string();
+                    // Keep the roll window inside the new retention.
+                    if self.settings.graph.time_window_s > secs {
+                        self.settings.graph.time_window_s = secs;
+                        self.graph_time_input = secs.to_string();
+                    }
+                    // Shrinking retention takes effect immediately.
+                    self.trim_samples(Local::now());
+                    let _ = settings::save(&self.settings);
+                    self.graph_cache.clear();
+                }
+            }
             Message::ClearGraph => {
+                // The one and only way to drop data out of the graph's view.
+                // The buffer is left intact, so a CSV export still contains
+                // everything recorded before the clear.
                 self.graph_start_time = Some(Local::now());
                 self.graph_cache.clear();
             }
@@ -1092,6 +1183,7 @@ impl AppState {
             }
             Message::CapRecordClear => {
                 self.samples.clear();
+                self.graph_start_time = None;
                 self.graph_cache.clear();
             }
             Message::CapChemistryChanged(v) => {
@@ -1293,7 +1385,7 @@ impl AppState {
         let status_bar = container(
             row![
                 badge(
-                    &format!("{}: {}", t!("label.bluetooth"), &conn_label),
+                    &format!("{}: {}", t!("label.bluetooth"), conn_label),
                     conn_color,
                 ),
                 Space::new().width(12.0),
@@ -1413,6 +1505,7 @@ impl AppState {
                 graph_settings.time_mode,
                 graph_settings.time_window_s,
                 self.graph_start_time,
+                self.settings.poll_interval_ms,
             );
             let v_toggle = toggle_btn("V", graph_settings.show_voltage, Message::ToggleGraphVoltage, COLOR_VOLTAGE);
             let i_toggle = toggle_btn("I", graph_settings.show_current, Message::ToggleGraphCurrent, COLOR_CURRENT);
@@ -1445,12 +1538,24 @@ impl AppState {
                     button(text(t!("btn.set")).size(11)).padding([2, 6]).on_press(Message::ApplyGraphTimeWindow)
                 );
             }
-            if graph_settings.time_mode == settings::GraphTimeMode::Infinite {
-                time_controls = time_controls.push(Space::new().width(6.0));
-                time_controls = time_controls.push(
-                    button(text(t!("graph.clear")).size(11)).padding([2, 6]).on_press(Message::ClearGraph)
-                );
-            }
+            // Clear is available in both modes: it sets one view epoch that both
+            // modes honour, so its effect no longer depends on which mode
+            // happened to be active when it was pressed.
+            time_controls = time_controls.push(Space::new().width(6.0));
+            time_controls = time_controls.push(
+                button(text(t!("graph.clear")).size(11)).padding([2, 6]).on_press(Message::ClearGraph)
+            );
+            // How much history actually exists, so a window larger than the
+            // buffer is visibly explained rather than silently ignored.
+            time_controls = time_controls.push(Space::new().width(8.0));
+            time_controls = time_controls.push(
+                text(format!(
+                    "{}: {}",
+                    t!("graph.buffer"),
+                    fmt_duration_short(self.buffered_span_s())
+                ))
+                .size(11),
+            );
             let resize_row = row![
                 v_toggle,
                 i_toggle,
@@ -2059,6 +2164,12 @@ impl AppState {
         .padding([4, 12])
         .on_press(Message::ToggleAutoConnect);
 
+        let retention_input = text_input("86400", &self.graph_retention_input)
+            .width(Length::Fixed(70.0))
+            .on_input(Message::GraphRetentionChanged)
+            .on_submit(Message::ApplyGraphRetention)
+            .size(12);
+
         let app_card = container(
             column![
                 text(t!("settings.card.application")).size(15),
@@ -2084,6 +2195,19 @@ impl AppState {
                     text(t!("settings.auto_connect")).size(13),
                     Space::new().width(Length::Fill),
                     auto_connect_toggle,
+                ].align_y(iced::Alignment::Center),
+                row![
+                    column![
+                        text(t!("settings.retention")).size(13),
+                        text(t!("settings.retention_hint")).size(11),
+                    ].spacing(2).width(Length::Fill),
+                    retention_input,
+                    Space::new().width(4.0),
+                    text("s").size(12),
+                    Space::new().width(6.0),
+                    button(text(t!("btn.set")).size(12))
+                        .padding([4, 10])
+                        .on_press(Message::ApplyGraphRetention),
                 ].align_y(iced::Alignment::Center),
             ]
             .spacing(8),
@@ -2368,6 +2492,18 @@ fn mode_btn_tip<'a>(
         .into()
 }
 
+/// Compact duration for UI labels: `2h05m`, `12m34s`, `45s`.
+fn fmt_duration_short(secs: i64) -> String {
+    let s = secs.max(0);
+    if s >= 3600 {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
 fn samples_summary(samples: &VecDeque<Sample>) -> String {
     if samples.is_empty() {
         return "(no samples yet — connect a device)".to_string();
@@ -2498,7 +2634,7 @@ fn write_csv(path: &std::path::Path, samples: &[Sample]) -> Result<()> {
             r,
             format!("{:.2}", s.temperature),
             s.runtime_s.to_string(),
-            s.mode.clone(),
+            s.mode.to_string(),
             if s.load_on { "1".to_string() } else { "0".to_string() },
         ])?;
     }
@@ -2524,6 +2660,7 @@ mod tests {
         let settings = Settings::default();
         let setpoint_default = format_setpoint(settings.last_mode, &settings.defaults);
         let time_window_str = settings.graph.time_window_s.to_string();
+        let retention_str = settings.graph.history_retention_s.to_string();
         AppState {
             args: Cli {
                 no_gui: false,
@@ -2549,7 +2686,7 @@ mod tests {
             device: None,
             connecting: false,
             last_status: None,
-            samples: VecDeque::with_capacity(MAX_SAMPLES),
+            samples: VecDeque::with_capacity(SAMPLES_PREALLOC),
             setpoint_input: setpoint_default,
             last_command_ok: true,
             show_settings: false,
@@ -2559,6 +2696,7 @@ mod tests {
             graph_cache: Cache::new(),
             chart_height: 160.0,
             graph_time_input: time_window_str,
+            graph_retention_input: retention_str,
             graph_start_time: None,
             cells_combo_state: combo_box::State::new(
                 (1u8..=20).map(|n| n.to_string()).collect(),
@@ -2660,12 +2798,182 @@ mod tests {
             resistance: 12.0,
             temperature: 25.0,
             runtime_s: 0,
-            mode: "CC".to_string(),
+            mode: "CC".into(),
             load_on: true,
         });
         assert!(!state.samples.is_empty());
         let _ = state.update(Message::ClearSamples);
         assert!(state.samples.is_empty());
+    }
+
+    fn sample_at(when: DateTime<Local>) -> Sample {
+        Sample {
+            when,
+            voltage: 12.0,
+            current: 1.0,
+            power: 12.0,
+            resistance: 12.0,
+            temperature: 25.0,
+            runtime_s: 0,
+            mode: "CC".into(),
+            load_on: true,
+        }
+    }
+
+    /// Fill the buffer with `n` samples ending now, one second apart.
+    fn fill(state: &mut AppState, n: usize) {
+        let now = Local::now();
+        for i in 0..n {
+            state
+                .samples
+                .push_back(sample_at(now - chrono::Duration::seconds((n - i) as i64)));
+        }
+    }
+
+    #[test]
+    fn toggle_time_mode_never_touches_the_buffer() {
+        let mut state = test_state();
+        fill(&mut state, 500);
+        let before = state.samples.len();
+        let first = state.samples.front().unwrap().when;
+
+        // Toggle back and forth mid-"run".
+        for _ in 0..4 {
+            let _ = state.update(Message::ToggleGraphTimeMode);
+            assert_eq!(state.samples.len(), before);
+            assert_eq!(state.samples.front().unwrap().when, first);
+            // And it must not smuggle in a clear epoch either.
+            assert!(state.graph_start_time.is_none());
+        }
+    }
+
+    #[test]
+    fn changing_the_window_never_touches_the_buffer() {
+        let mut state = test_state();
+        fill(&mut state, 500);
+        let before = state.samples.len();
+
+        state.graph_time_input = "600".to_string();
+        let _ = state.update(Message::ApplyGraphTimeWindow);
+        assert_eq!(state.samples.len(), before);
+        assert!(state.graph_start_time.is_none());
+    }
+
+    /// Clear affects the graph's view only — the buffer behind CSV export is
+    /// untouched, so an export after a clear still contains the whole run.
+    #[test]
+    fn clear_graph_hides_data_but_keeps_it_exportable() {
+        let mut state = test_state();
+        fill(&mut state, 500);
+        let before = state.samples.len();
+
+        let _ = state.update(Message::ClearGraph);
+        assert!(state.graph_start_time.is_some());
+        assert_eq!(state.samples.len(), before);
+    }
+
+    /// Clearing the buffer must also drop the view epoch, so no stale cutoff
+    /// outlives the data it referred to.
+    #[test]
+    fn clearing_samples_resets_the_graph_epoch() {
+        let mut state = test_state();
+        fill(&mut state, 10);
+        let _ = state.update(Message::ClearGraph);
+        assert!(state.graph_start_time.is_some());
+
+        let _ = state.update(Message::ClearSamples);
+        assert!(state.graph_start_time.is_none());
+
+        let _ = state.update(Message::ClearGraph);
+        let _ = state.update(Message::CapRecordClear);
+        assert!(state.graph_start_time.is_none());
+    }
+
+    #[test]
+    fn window_is_clamped_to_retention() {
+        let mut state = test_state();
+        state.settings.graph.history_retention_s = 600;
+
+        // The old code clamped to 86400 regardless of how much was buffered.
+        state.graph_time_input = "86400".to_string();
+        let _ = state.update(Message::ApplyGraphTimeWindow);
+        assert_eq!(state.settings.graph.time_window_s, 600);
+        assert_eq!(state.graph_time_input, "600");
+
+        state.graph_time_input = "1".to_string();
+        let _ = state.update(Message::ApplyGraphTimeWindow);
+        assert_eq!(state.settings.graph.time_window_s, 5);
+    }
+
+    #[test]
+    fn shrinking_retention_pulls_the_window_in_with_it() {
+        let mut state = test_state();
+        state.settings.graph.time_window_s = 3600;
+
+        state.graph_retention_input = "300".to_string();
+        let _ = state.update(Message::ApplyGraphRetention);
+        assert_eq!(state.settings.graph.history_retention_s, 300);
+        assert_eq!(state.settings.graph.time_window_s, 300);
+        assert_eq!(state.graph_time_input, "300");
+    }
+
+    #[test]
+    fn trim_drops_only_samples_past_retention() {
+        let mut state = test_state();
+        state.settings.graph.history_retention_s = 60;
+        let now = Local::now();
+        // One well inside retention, one well outside it.
+        state.samples.push_back(sample_at(now - chrono::Duration::seconds(600)));
+        state.samples.push_back(sample_at(now - chrono::Duration::seconds(10)));
+
+        state.trim_samples(now);
+        assert_eq!(state.samples.len(), 1);
+        assert!((now - state.samples.front().unwrap().when).num_seconds() < 60);
+    }
+
+    #[test]
+    fn buffer_capacity_follows_poll_rate_and_retention() {
+        // 1 h at 5 Hz — the old fixed 7200 cap held only ~24 min of this.
+        assert_eq!(settings::sample_capacity(200, 3600), 18_000);
+        // Slow poll, short retention: floored so the graph still has data.
+        assert_eq!(settings::sample_capacity(2000, 60), settings::MIN_BUFFERED_SAMPLES);
+        // A poll slower than 1 s must not truncate to a zero sample rate.
+        assert_eq!(settings::sample_capacity(2000, 86_400), 43_200);
+        // Very fast poll, long retention: capped for memory.
+        assert_eq!(settings::sample_capacity(50, 86_400), settings::MAX_BUFFERED_SAMPLES);
+    }
+
+    /// The 24 h default exists for long CAP runs (car battery discharge), so the
+    /// memory backstop must not quietly cut it short at the default poll rate.
+    #[test]
+    fn default_retention_is_reachable_at_the_default_poll_rate() {
+        let s = Settings::default();
+        assert_eq!(s.graph.history_retention_s, 86_400);
+
+        let cap = settings::sample_capacity(s.poll_interval_ms, s.graph.history_retention_s);
+        let held_s = cap as u64 * s.poll_interval_ms / 1000;
+        assert_eq!(held_s, 86_400, "backstop truncates the default retention");
+        assert!(cap < settings::MAX_BUFFERED_SAMPLES);
+    }
+
+    /// Guards the memory budget behind `MAX_BUFFERED_SAMPLES`: at 64 bytes a
+    /// sample the full buffer is ~32 MB.  Adding an owned `String` here would
+    /// silently multiply that, which is why `mode` is an `Arc<str>`.
+    #[test]
+    fn sample_stays_small() {
+        assert!(
+            std::mem::size_of::<Sample>() <= 64,
+            "Sample grew to {} bytes",
+            std::mem::size_of::<Sample>()
+        );
+    }
+
+    #[test]
+    fn duration_labels_are_compact() {
+        assert_eq!(fmt_duration_short(0), "0s");
+        assert_eq!(fmt_duration_short(45), "45s");
+        assert_eq!(fmt_duration_short(754), "12m34s");
+        assert_eq!(fmt_duration_short(7_500), "2h05m");
     }
 
     #[test]
@@ -2696,10 +3004,12 @@ mod tests {
         state.pending_mode_switch = Some((ModeKind::CP, std::time::Instant::now()));
 
         // Incoming status packet still reports CC — should be ignored.
-        let mut st = EL15Status::default();
-        st.valid = true;
-        st.mode_byte = 0x01; // CC
-        st.mode_name = "CC".to_string();
+        let mut st = EL15Status {
+            valid: true,
+            mode_byte: 0x01, // CC
+            mode_name: "CC".to_string(),
+            ..Default::default()
+        };
         let _ = state.update(Message::DeviceEvent(DeviceEvent::Status(st.clone())));
         // Mode must remain CP (not overridden by status).
         assert_eq!(state.settings.last_mode, ModeKind::CP);

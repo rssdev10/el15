@@ -92,18 +92,43 @@ Located in the right column, below the info cards. Hidden for CC/CV/CR/CP modes.
 - Window size is persisted between sessions (saved in settings)
 - Minimum window size: 400×400 px
 - Combined mode: voltage scale on left axis, current and power scales on right axis (color-coded)
+- **X axis is time-based**, not sample-index based. Points are positioned by timestamp within an
+  explicit time domain, and the axis is labelled underneath:
+  - Roll: labels are relative to now (`-1h02m`, `-2m05s`, `-45s`, `0`)
+  - Infinite: labels are wall-clock (`HH:MM:SS`)
+  - Full labels are drawn when the plot is at least 320 px wide; narrower plots are labelled at
+    their ends only. Split ↕ labels the bottom sub-chart only (all sub-charts share one domain).
+- Traces are **min/max decimated** to at most two points per horizontal pixel. The full time span
+  is always drawn — there is no cap on how many samples a plot may cover — and single-sample
+  transients survive decimation.
+- A pause longer than 5 poll intervals (minimum 1.5 s) **breaks the polyline**, so a disconnect or
+  a paused log renders as a gap instead of a straight line. An isolated reading between two gaps is
+  drawn as a dot.
 - Time mode controls (bottom toolbar row, left-aligned):
-  - **Mode toggle button** shows current mode: `⟳ Roll` or `∞ Infinite`; click to switch
-  - **Roll mode**: rolling window of the last N seconds; time window input + "Set" button are shown
-  - **Infinite mode**: all data since app start or last Clear; time window input and "Set" are hidden
-  - **Clear button** (Infinite mode only): resets graph display start time to now; does NOT delete samples
+  - **Mode toggle button** shows current mode: `⟳ Roll` or `∞ Infinite`; click to switch.
+    Switching is a **view-only** change: it never adds to or removes from the sample buffer, so it
+    is safe to toggle mid-run.
+  - **Roll mode**: the last N seconds; time window input + "Set" button are shown. The domain is the
+    window itself, so a partly-filled window draws on the right-hand portion of the canvas rather
+    than stretching to fill it. The window is clamped to the history retention setting.
+  - **Infinite mode**: everything retained in the buffer since the last Clear; the window input and
+    "Set" are hidden.
+  - **Clear button** (both modes): sets the graph's view epoch to now. Samples before the epoch are
+    hidden from the graph in **both** modes, but are **not** deleted — a CSV export still contains
+    them. Pressing Clear is the only action that hides recorded data from the graph.
+  - **Buffer label**: wall-clock span currently held in the buffer, so a window wider than the
+    available history is visibly explained rather than silently ignored.
 - Hide/show toggle button
-- Graph data is independent of CSV export (export uses all collected samples)
+- The graph and CSV export read the **same** buffer. Retention (Settings → Application → History
+  retention, default 86400 s = 24 h) bounds both together: the graph can never show something an
+  export would miss, and vice versa. Clearing the samples buffer also resets the graph's view epoch.
+  The 24 h default is sized for long CAP runs such as a car battery discharge.
 
 ### 6. Samples Panel
 - Sample count
 - Last sample summary (V/I/P values)
-- Clear button (clears all samples)
+- Clear button (deletes all samples — unlike the chart's Clear, this discards data that would
+  otherwise be exportable; it also resets the chart's view epoch)
 - Export button (saves CSV with columns: timestamp, voltage, current, power, resistance, mode)
 
 ### 7. Connection Panel
@@ -160,6 +185,12 @@ Responsive card-based layout. On wide windows (≥720px), cards are arranged in 
    - Language (dropdown)
    - Poll interval (dropdown: 50/100/200/500/1000/2000 ms; helper text below)
    - Auto-connect to first EL15 (toggle)
+   - History retention (text input + "Set"; seconds, clamped to 60–86400, default 86400 = 24 h;
+     helper text below). Bounds the shared sample buffer used by both the graph and CSV export.
+     Shrinking it trims the buffer immediately and pulls the Roll window in with it.
+     A hard backstop of 500 000 samples (~32 MB) also applies: it sits just above 24 h at the
+     default 200 ms poll, so a *faster* poll reaches the ceiling first and retains proportionally
+     less wall-clock time (at 50 ms, roughly 7 h).
 
 2. **SCPI Server**
    - Enable SCPI server (toggle)

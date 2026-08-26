@@ -54,6 +54,44 @@ pub struct GraphSettings {
     pub show_power: bool,
     pub time_mode: GraphTimeMode,
     pub time_window_s: u32,
+    /// How long raw samples are retained in the in-memory buffer, in seconds.
+    ///
+    /// That buffer is shared: the graph reads it and CSV export writes it out.
+    /// Retention therefore bounds both — nothing the graph can show is missing
+    /// from an export, and nothing exportable is hidden from the graph.
+    ///
+    /// `#[serde(default)]` is required: without it, a `settings.toml` written by
+    /// an older build fails to deserialize and confy silently resets *every*
+    /// setting to its default.
+    #[serde(default = "default_retention_s")]
+    pub history_retention_s: u32,
+}
+
+/// 24 hours.  Sized for the longest real runs — a car battery discharged in CAP
+/// mode can log for the better part of a day, and a shorter default would cut
+/// the head off exactly the measurement that needs the whole curve.
+///
+/// At the default 200 ms poll this is 432 000 samples, roughly 28 MB.
+fn default_retention_s() -> u32 {
+    86_400
+}
+
+/// Hard upper bound on the shared sample buffer, independent of retention.
+///
+/// A `Sample` is about 64 bytes, so this caps the buffer near 32 MB.  It sits
+/// just above 24 h at the default 200 ms poll; a faster poll hits this ceiling
+/// first and retains proportionally less wall-clock time (at 50 ms, ~7 h).
+pub const MAX_BUFFERED_SAMPLES: usize = 500_000;
+
+/// Lower bound, so a very short retention still leaves a usable graph.
+pub const MIN_BUFFERED_SAMPLES: usize = 600;
+
+/// Number of samples to retain for `retention_s` seconds at the given poll rate.
+pub fn sample_capacity(poll_interval_ms: u64, retention_s: u32) -> usize {
+    // Scale before dividing: at a poll slower than 1 s, a samples-per-second
+    // rate would truncate to zero.
+    let wanted = (retention_s as u64).saturating_mul(1000) / poll_interval_ms.max(1);
+    (wanted as usize).clamp(MIN_BUFFERED_SAMPLES, MAX_BUFFERED_SAMPLES)
 }
 
 impl Default for GraphSettings {
@@ -65,6 +103,7 @@ impl Default for GraphSettings {
             show_power: true,
             time_mode: GraphTimeMode::Roll,
             time_window_s: 60,
+            history_retention_s: default_retention_s(),
         }
     }
 }

@@ -32,6 +32,7 @@
   "label.discharge_current": "Discharge current",
   "label.on_device": "On device",
   "label.cap_device_only": "Cutoff / Timer",
+  "label.dcr_device_only": "Test currents / Timer",
   "label.cap_device_only_hint": "set on the device — not available over Bluetooth",
   "label.set_current": "Set Current",
   "label.set_voltage": "Set Voltage",

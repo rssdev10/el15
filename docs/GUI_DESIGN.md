@@ -96,9 +96,19 @@ deleted, so they can be restored if a firmware revision exposes the parameters),
 fields are retained as local notes.
 
 **DCR mode (DC Internal Resistance Test):**
-- I1 current (mA, range 20–12000)
-- I2 current (mA, range 20–12000)
-- Timer (seconds, range 1–99)
+
+Like the CAP cutoff, the DCR test currents and timer have **no BLE command** — they are front-panel
+settings (manual §3.4.2 "DCR Params"). Unlike the CAP cutoff, they are *readable*: the DCR status
+packet carries both test currents.
+
+- Read-only display: "On device: I1: 20 mA   I2: 1000 mA", taken from status bytes 15..19 and
+  19..23 (Amps on the wire, shown in mA). Shows "—" until the first status packet arrives.
+- A static note that the test currents and timer are set on the device and are not available over
+  Bluetooth.
+
+*Previously* this panel offered editable I1 / I2 / Timer inputs. None was ever transmitted, and no
+command exists that could transmit them. Those editors are commented out in `battery_params_panel`
+(kept, not deleted) and their settings fields are retained as local notes.
 
 ### 5. Chart
 - V/I/P graph with per-trace toggles (V, I, P colored buttons)

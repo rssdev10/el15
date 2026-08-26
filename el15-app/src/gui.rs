@@ -1290,12 +1290,15 @@ impl AppState {
                 let _ = settings::save(&self.settings);
             }
             Message::DcrStart => {
-                // DCR mode: ensure mode is set, then enable load to start test
+                // DCR mode: ensure mode is set, then enable load to start test.
                 if let Some(dev) = self.device.clone() {
+                    // Paced: sent back-to-back, the load command is dropped and
+                    // the test never starts until the button is pressed again.
+                    let frames = vec![build_mode_cmd(Mode::DCR), CMD_LOAD_ON.to_vec()];
+                    self.pause_poll_ticks = self.pause_ticks_for(frames.len());
                     return Task::perform(
                         async move {
-                            let _ = dev.send(&build_mode_cmd(Mode::DCR)).await;
-                            let _ = dev.send(&CMD_LOAD_ON).await;
+                            let _ = dev.send_sequence(&frames).await;
                             Message::Noop
                         },
                         |m| m,
@@ -2050,32 +2053,38 @@ impl AppState {
                 .into()
             }
             ModeKind::DCR => {
+                // Like the CAP cutoff, the DCR test currents and timer have no
+                // BLE command — they are front-panel settings (manual §3.4.2,
+                // "DCR Params").  Verified on HW:2.0 / SW:1.7: neither `0x04`
+                // nor `0x05` moves them, and they are the only writable opcodes
+                // whose payload shape is known.  The editors below are commented
+                // out rather than deleted; see `docs/BT_PROTOCOL.md`.
+                //
+                // They *are* readable, though: the status packet reports both
+                // test currents in DCR mode, so show what the device holds.
+                let (i1, i2) = match self.last_status.as_ref() {
+                    Some(st) => (
+                        format!("{:.0} mA", st.dcr_i1 * 1000.0),
+                        format!("{:.0} mA", st.dcr_i2 * 1000.0),
+                    ),
+                    None => ("—".to_string(), "—".to_string()),
+                };
+
                 container(
                     column![
                         text(t!("label.dcr_params").to_string()).size(13),
                         row![
-                            text("I1: ").size(12),
-                            text_input("20", &self.settings.dcr.i1_input)
-                                .on_input(Message::DcrI1Changed)
-                                .width(Length::Fixed(40.0))
-                                .size(13),
-                            text("mA").size(12),
-                            Space::new().width(12.0),
-                            text("I2: ").size(12),
-                            text_input("1000", &self.settings.dcr.i2_input)
-                                .on_input(Message::DcrI2Changed)
-                                .width(Length::Fixed(60.0))
-                                .size(13),
-                            text("mA").size(12)
+                            text(format!("{}:", t!("label.on_device"))).size(12),
+                            Space::new().width(6.0),
+                            text(format!("I1: {i1}")).size(12),
+                            Space::new().width(16.0),
+                            text(format!("I2: {i2}")).size(12),
                         ].align_y(iced::Alignment::Center),
-                        row![
-                            text(format!("{}:", t!("label.timer"))).size(12),
-                            text_input("2", &self.settings.dcr.timer_input)
-                                .on_input(Message::DcrTimerChanged)
-                                .width(Length::Fixed(30.0))
-                                .size(13),
-                            text("s").size(12),
-                        ].spacing(6).align_y(iced::Alignment::Center),
+                        text(format!(
+                            "{}: {}",
+                            t!("label.dcr_device_only"),
+                            t!("label.cap_device_only_hint")
+                        )).size(11),
                     ]
                     .spacing(6),
                 )
@@ -2083,6 +2092,32 @@ impl AppState {
                 .style(container::bordered_box)
                 .width(Length::Fill)
                 .into()
+
+                // ---- Not sendable over BLE — kept for a future firmware ----
+                //
+                // row![
+                //     text("I1: ").size(12),
+                //     text_input("20", &self.settings.dcr.i1_input)
+                //         .on_input(Message::DcrI1Changed)
+                //         .width(Length::Fixed(40.0))
+                //         .size(13),
+                //     text("mA").size(12),
+                //     Space::new().width(12.0),
+                //     text("I2: ").size(12),
+                //     text_input("1000", &self.settings.dcr.i2_input)
+                //         .on_input(Message::DcrI2Changed)
+                //         .width(Length::Fixed(60.0))
+                //         .size(13),
+                //     text("mA").size(12)
+                // ].align_y(iced::Alignment::Center),
+                // row![
+                //     text(format!("{}:", t!("label.timer"))).size(12),
+                //     text_input("2", &self.settings.dcr.timer_input)
+                //         .on_input(Message::DcrTimerChanged)
+                //         .width(Length::Fixed(30.0))
+                //         .size(13),
+                //     text("s").size(12),
+                // ].spacing(6).align_y(iced::Alignment::Center),
             }
             _ => Space::new().height(0.0).into(),
         }
@@ -3195,6 +3230,24 @@ mod tests {
         let setpoint_frame = build_set_setpoint_cmd(5.0);
         assert_eq!(setpoint_frame[3], 0x04);
         assert_ne!(cap_frame, setpoint_frame);
+    }
+
+    /// DCR's test currents and timer have no BLE command, so nothing in the
+    /// DCR path may send a parameter frame. `stored_setpoint` refusing DCR is
+    /// what `ToggleLoad` now relies on; the panel itself is read-only.
+    #[test]
+    fn dcr_params_are_never_sent() {
+        let mut state = test_state();
+        let _ = state.update(Message::DcrI1Changed("50".to_string()));
+        let _ = state.update(Message::DcrI2Changed("500".to_string()));
+        let _ = state.update(Message::DcrTimerChanged("3".to_string()));
+
+        // Retained as local notes...
+        assert_eq!(state.settings.dcr.i1_input, "50");
+        assert_eq!(state.settings.dcr.i2_input, "500");
+        assert_eq!(state.settings.dcr.timer_input, "3");
+        // ...but there is no send path for them.
+        assert!(stored_setpoint(&state.settings, ModeKind::DCR).is_none());
     }
 
     #[test]

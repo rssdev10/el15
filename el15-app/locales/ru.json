@@ -32,6 +32,7 @@
   "label.discharge_current": "Ток разряда",
   "label.on_device": "На устройстве",
   "label.cap_device_only": "Отсечка / Таймер",
+  "label.dcr_device_only": "Токи измерения / Таймер",
   "label.cap_device_only_hint": "задаются на устройстве — недоступны по Bluetooth",
   "label.set_current": "Задать ток",
   "label.set_voltage": "Задать напряжение",

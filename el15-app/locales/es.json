@@ -33,7 +33,7 @@
   "label.on_device": "En el dispositivo",
   "label.cap_device_only": "Corte / Temporizador",
   "label.dcr_device_only": "Corrientes de prueba / Temporizador",
-  "label.cap_device_only_hint": "se ajustan en el dispositivo: no disponibles por Bluetooth",
+  "label.device_only_hint": "se ajustan en el dispositivo: no disponibles por Bluetooth",
   "label.set_current": "Corriente fijada",
   "label.set_voltage": "Tensión fijada",
   "label.set_resistance": "Resistencia fijada",

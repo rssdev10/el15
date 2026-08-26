@@ -1942,7 +1942,7 @@ impl AppState {
                 if current_valid && self.device.is_some() {
                     set_current_btn = set_current_btn.on_press(Message::ApplyCapCurrent);
                 }
-                let mut current_row = row![
+                let current_row = row![
                     text(format!("{}:", t!("label.discharge_current"))).size(12),
                     text_input("1.000", &self.settings.cap.current_input)
                         .on_input(Message::CapCurrentChanged)
@@ -1955,27 +1955,35 @@ impl AppState {
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
 
-                // What the device actually holds, read back after every write.
-                current_row = current_row.push(Space::new().width(16.0));
-                current_row = current_row.push(
-                    text(match self.device_cap_current {
-                        Some(a) => format!("{}: {:.3} A ({:.0} mA)", t!("label.on_device"), a, a * 1000.0),
-                        None => format!("{}: —", t!("label.on_device")),
-                    })
-                    .size(12),
-                );
-
                 // Line 2: the parameters the protocol cannot reach.
                 let device_only_row = row![
                     text(format!(
                         "{}: {}",
                         t!("label.cap_device_only"),
-                        t!("label.cap_device_only_hint")
+                        t!("label.device_only_hint")
                     ))
                     .size(11),
                 ]
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
+
+                // // Line 3: what the device actually holds, read back after every
+                // // write.  On its own line rather than beside the input, so the
+                // // editable value and the device's value are not confused.
+                // let on_device_row = row![
+                //     text(match self.device_cap_current {
+                //         Some(a) => format!(
+                //             "{}: {:.3} A ({:.0} mA)",
+                //             t!("label.on_device"),
+                //             a,
+                //             a * 1000.0
+                //         ),
+                //         None => format!("{}: —", t!("label.on_device")),
+                //     })
+                //     .size(12),
+                // ]
+                // .spacing(6)
+                // .align_y(iced::Alignment::Center);
 
                 // ---- Not sendable over BLE — kept for a future firmware ----
                 //
@@ -2044,6 +2052,7 @@ impl AppState {
                         text(t!("label.cap_params").to_string()).size(13),
                         current_row,
                         device_only_row,
+                        // on_device_row,
                     ]
                     .spacing(6),
                 )
@@ -2073,6 +2082,13 @@ impl AppState {
                 container(
                     column![
                         text(t!("label.dcr_params").to_string()).size(13),
+                        // Same order as the CAP panel: the device-only notice
+                        // first, then the read-back values on their own line.
+                        text(format!(
+                            "{}: {}",
+                            t!("label.dcr_device_only"),
+                            t!("label.device_only_hint")
+                        )).size(11),
                         row![
                             text(format!("{}:", t!("label.on_device"))).size(12),
                             Space::new().width(6.0),
@@ -2080,11 +2096,6 @@ impl AppState {
                             Space::new().width(16.0),
                             text(format!("I2: {i2}")).size(12),
                         ].align_y(iced::Alignment::Center),
-                        text(format!(
-                            "{}: {}",
-                            t!("label.dcr_device_only"),
-                            t!("label.cap_device_only_hint")
-                        )).size(11),
                     ]
                     .spacing(6),
                 )

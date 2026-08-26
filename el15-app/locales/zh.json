@@ -33,7 +33,7 @@
   "label.on_device": "设备上",
   "label.cap_device_only": "截止电压 / 定时器",
   "label.dcr_device_only": "测试电流 / 定时器",
-  "label.cap_device_only_hint": "在设备上设置 — 蓝牙不支持",
+  "label.device_only_hint": "在设备上设置 — 蓝牙不支持",
   "label.set_current": "设定电流",
   "label.set_voltage": "设定电压",
   "label.set_resistance": "设定电阻",

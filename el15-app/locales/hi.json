@@ -33,7 +33,7 @@
   "label.on_device": "डिवाइस पर",
   "label.cap_device_only": "कट-ऑफ / टाइमर",
   "label.dcr_device_only": "परीक्षण धाराएँ / टाइमर",
-  "label.cap_device_only_hint": "डिवाइस पर सेट करें — ब्लूटूथ से उपलब्ध नहीं",
+  "label.device_only_hint": "डिवाइस पर सेट करें — ब्लूटूथ से उपलब्ध नहीं",
   "label.set_current": "करंट सेट करें",
   "label.set_voltage": "वोल्टेज सेट करें",
   "label.set_resistance": "प्रतिरोध सेट करें",

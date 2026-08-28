@@ -25,13 +25,32 @@ use tracing::{debug, info};
 use uuid::{uuid, Uuid};
 
 use crate::error::{Error, Result};
-use crate::protocol::{parse_status_packet, parse_firmware_version, EL15Status, HEADER, POLL_PKT, CMD_INIT, CMD_INFO};
+use crate::protocol::{
+    parse_cap_current, parse_status_packet, parse_firmware_version, EL15Status, HEADER, POLL_PKT,
+    CMD_INIT, CMD_INFO, CMD_GET_CAP_CURRENT,
+};
 
 const SCAN_DURATION: Duration = Duration::from_secs(5);
 
 /// GATT service UUID exposed by ALIENTEK EL15 (short UUID 0xFFF0).
 /// The writable and notify characteristics live under this service.
 pub const EL15_SERVICE_UUID: Uuid = uuid!("0000fff0-0000-1000-8000-00805f9b34fb");
+
+/// Minimum gap between two consecutive command writes.
+///
+/// The write characteristic advertises WRITE_WITHOUT_RESPONSE, so [`Device::send`]
+/// uses it — and that has no flow control: frames written back-to-back are
+/// silently dropped, with no error on this side.
+///
+/// Measured on HW:2.0 / SW:1.7. Three commands sent with no gap (set mode, set
+/// setpoint, set CAP current) landed **none** of the trailing two — the CAP
+/// current read back unchanged three times running, and one reply came back
+/// corrupted (`df 01 04 39 …`, containing bytes of the outgoing frame). The
+/// same three spaced 120 ms apart took effect 3 times out of 3.
+///
+/// This is why a burst of commands used to need several button presses before
+/// one "took".
+pub const INTER_COMMAND_GAP: Duration = Duration::from_millis(120);
 
 /// Friendly name prefixes used as a fallback when advertisement data does not
 /// carry the service UUID list (some BT stacks strip 128-bit UUIDs from the
@@ -71,6 +90,11 @@ fn short_id(id: &str) -> String {
 pub enum DeviceEvent {
     Status(EL15Status),
     FirmwareVersion(String),
+    /// CAP discharge current in Amps, from a `DF 07 03 0A` response.
+    ///
+    /// Only emitted in reply to [`Device::request_cap_current`]; the device
+    /// never reports this value in the periodic status packet.
+    CapCurrent(f32),
     RawNotification(Vec<u8>),
     Disconnected,
 }
@@ -326,6 +350,8 @@ impl Device {
                     }
                 } else if let Some(ver) = parse_firmware_version(&data) {
                     let _ = tx.send(DeviceEvent::FirmwareVersion(ver)).await;
+                } else if let Some(amps) = parse_cap_current(&data) {
+                    let _ = tx.send(DeviceEvent::CapCurrent(amps)).await;
                 }
             }
             let _ = tx.send(DeviceEvent::Disconnected).await;
@@ -357,8 +383,31 @@ impl Device {
         Ok(())
     }
 
+    /// Send several commands in order, pausing [`INTER_COMMAND_GAP`] between them.
+    ///
+    /// Always prefer this over consecutive [`Device::send`] calls: commands
+    /// written back-to-back are silently dropped (see the constant's docs).
+    pub async fn send_sequence(&self, frames: &[Vec<u8>]) -> Result<()> {
+        for (i, frame) in frames.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(INTER_COMMAND_GAP).await;
+            }
+            self.send(frame).await?;
+        }
+        Ok(())
+    }
+
     pub async fn poll(&self) -> Result<()> {
         self.send(&POLL_PKT).await
+    }
+
+    /// Ask the device for its CAP discharge current.
+    ///
+    /// The answer arrives asynchronously as [`DeviceEvent::CapCurrent`]. This
+    /// is the only way to observe the value — CAP status packets carry the
+    /// measured capacity in the field that holds the setpoint in other modes.
+    pub async fn request_cap_current(&self) -> Result<()> {
+        self.send(&CMD_GET_CAP_CURRENT).await
     }
 
     /// Send the init handshake and info request to wake up the device's

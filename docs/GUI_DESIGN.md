@@ -74,16 +74,47 @@ Right side — three stacked info cells (mode-dependent):
 Located in the right column, below the info cards. Hidden for CC/CV/CR/CP modes.
 
 **CAP mode (Capacity Test):**
-- Line 1: Timer enable/disable toggle. Duration input (HH:MM:SS) is visible only when timer is enabled, on the same line as the Timer toggle.
-- Line 2: Cutoff voltage input (always visible, range 0.1–60.0 V) + Chemistry type selector (N/A, NiMH/NiCd, NiZn, Li-Ion, LiPo, LiFePO4, Na-Ion) + Cells count combo box (visible only when chemistry is not N/A; allows picking 1–20 from dropdown or typing any value directly).
-- When chemistry is selected, cutoff voltage is auto-calculated as (per-cell voltage × number of cells).
-- Per-cell cutoff voltages: NiMH/NiCd=1.00V, NiZn=1.20V, Li-Ion=3.00V, LiPo=3.00V, LiFePO4=2.50V, Na-Ion=2.00V.
-- Chemistry/cells selections are persisted in settings.
+
+Only one CAP parameter is reachable over Bluetooth. The BLE protocol has a dedicated opcode for
+the discharge current (write `0x05`, read `0x0A`) but **no command at all** for the cutoff voltage
+or the timer — those are front-panel settings. See `docs/BT_PROTOCOL.md`.
+
+- Line 1: **Discharge current** input (A, range 0–12, i.e. 0–12000 mA) + "Set" button. This is
+  sent to the device with opcode `0x05`. "Set" is disabled while no device is connected or the
+  value is out of range.
+- Line 2: a static note that Cutoff / Timer are set on the device and are not available over
+  Bluetooth.
+- Line 3 (temporary removed): **"On device: N.NNN A (NNNN mA)"** — the value read back with `0x0A` after each write.
+  On its own line, not beside the input, so the editable value and the device's value are not
+  confused. The device stores milliamps, so the readback is quantised (5.0 comes back as
+  5.0000010) and must never be compared for exact equality. Shows "—" until the device answers.
+- The discharge current is **not** present in the status packet, so it is requested explicitly on
+  entering CAP mode and after every write.
+
+*Previously* this panel offered editable Timer, Cutoff voltage, Chemistry and Cells controls. None
+of them was ever transmitted to the device, and no BLE command exists that could transmit them —
+they silently did nothing. Those editors are commented out in `battery_params_panel` (kept, not
+deleted, so they can be restored if a firmware revision exposes the parameters), and their settings
+fields are retained as local notes.
 
 **DCR mode (DC Internal Resistance Test):**
-- I1 current (mA, range 20–12000)
-- I2 current (mA, range 20–12000)
-- Timer (seconds, range 1–99)
+
+Like the CAP cutoff, the DCR test currents and timer have **no BLE command** — they are front-panel
+settings (manual §3.4.2 "DCR Params"). Unlike the CAP cutoff, they are *readable*: the DCR status
+packet carries both test currents.
+
+- Line 1: a static note that the test currents and timer are set on the device and are not
+  available over Bluetooth.
+- Line 2: read-only **"On device: I1: 20 mA   I2: 1000 mA"**, taken from status bytes 15..19 and
+  19..23 (Amps on the wire, shown in mA). Shows "—" until the first status packet arrives.
+
+Both mode panels use the same order — actionable controls, then the device-only notice, then the
+read-back values — and share one i18n key for the notice text (`label.device_only_hint`), which is
+therefore named after neither mode.
+
+*Previously* this panel offered editable I1 / I2 / Timer inputs. None was ever transmitted, and no
+command exists that could transmit them. Those editors are commented out in `battery_params_panel`
+(kept, not deleted) and their settings fields are retained as local notes.
 
 ### 5. Chart
 - V/I/P graph with per-trace toggles (V, I, P colored buttons)
@@ -157,7 +188,7 @@ Located in the right column, below the info cards. Hidden for CC/CV/CR/CP modes.
 | CV | Set Voltage | V | 0.100–60.000 |
 | CR | Set Resistance | Ω | 0.1–7500.0 |
 | CP | Set Power | W | 0.00–150.00 |
-| CAP | Cutoff V | V | 0.1–60.0 |
+| CAP | Discharge current | A | 0.000–12.000 (device range 0–12000 mA) |
 | DCR | Current | mA | 20–12000 |
 
 ### Setpoint Validation

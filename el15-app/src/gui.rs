@@ -30,8 +30,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, info, warn};
 
 use el15_bt::{
-    build_mode_cmd, build_set_setpoint_cmd, scan_devices, scan_for_device, Device, DeviceEvent,
-    DeviceInfo, EL15Status, Mode, CMD_LOAD_OFF, CMD_LOAD_ON,
+    build_mode_cmd, build_set_cap_current_cmd, build_set_setpoint_cmd, scan_devices,
+    scan_for_device, Device, DeviceEvent, DeviceInfo, EL15Status, Mode, CAP_CURRENT_MAX_A,
+    CMD_GET_CAP_CURRENT, CMD_LOAD_OFF, CMD_LOAD_ON, INTER_COMMAND_GAP,
 };
 
 use el15_scpi::{ScpiServer, ScpiServerConfig, SharedState as ScpiSharedState};
@@ -145,6 +146,8 @@ pub enum Message {
     CapTimerToggle,
     CapTimerChanged(String),
     CapCutoffChanged(String),
+    CapCurrentChanged(String),
+    ApplyCapCurrent,
     CapRecordClear,
     CapChemistryChanged(String),
     CapCellsChanged(String),
@@ -227,10 +230,18 @@ pub struct AppState {
     chart_height: f32,
     graph_time_input: String,
     graph_retention_input: String,
+    /// CAP discharge current last read back from the device (Amps), from a
+    /// `DF 07 03 0A` reply. `None` until the device answers — it is never
+    /// present in the periodic status packet.
+    device_cap_current: Option<f32>,
     /// Epoch set by the graph's **Clear** button: samples older than this are
     /// hidden from the graph but kept in the buffer for CSV export.  Set here
     /// and nowhere else, so nothing but Clear can hide recorded data.
     graph_start_time: Option<DateTime<Local>>,
+    /// Retained for the CAP cells selector, which is commented out in
+    /// `battery_params_panel` because the cutoff it feeds cannot be sent
+    /// over BLE. Kept so that editor can be restored as-is.
+    #[allow(dead_code)]
     cells_combo_state: combo_box::State<String>,
 
     // ---- flash / DFU page ----
@@ -320,6 +331,7 @@ impl AppState {
             chart_height: 160.0,
             graph_time_input: time_window_str,
             graph_retention_input: retention_str,
+            device_cap_current: None,
             graph_start_time: None,
             cells_combo_state: combo_box::State::new((1u8..=20).map(|n| n.to_string()).collect()),
             show_flash_page: false,
@@ -372,6 +384,19 @@ impl AppState {
 
     fn title(&self) -> String {
         format!("{} v{}", t!("app.title"), env!("CARGO_PKG_VERSION"))
+    }
+
+    /// How many poll ticks to skip while a burst of `frames` commands is sent.
+    ///
+    /// A burst takes `(frames - 1) * INTER_COMMAND_GAP` to drain, and a poll
+    /// landing in the middle of it would be one more back-to-back write — the
+    /// very thing the gap exists to prevent. Scaled to the poll interval so a
+    /// fast poll rate does not resume early.
+    fn pause_ticks_for(&self, frames: usize) -> u8 {
+        let burst_ms = frames.saturating_sub(1) as u64 * INTER_COMMAND_GAP.as_millis() as u64;
+        let interval = self.settings.poll_interval_ms.max(1);
+        // +1 so at least one tick is always skipped, and one more for slack.
+        (burst_ms.div_ceil(interval) + 2).min(u8::MAX as u64) as u8
     }
 
     /// Upper bound on the shared sample buffer at the current poll rate.
@@ -450,15 +475,14 @@ impl AppState {
                         if secs >= bucket_start && secs < bucket_start + tick_ms {
                             if let Some(dev) = self.device.clone() {
                                 info!("retrying mode switch to {:?} (elapsed {}ms)", target, secs);
-                                self.pause_poll_ticks = 3;
-                                let mode = target.to_proto();
-                                let setpoint = stored_setpoint(&self.settings, target);
+                                let mut frames = vec![build_mode_cmd(target.to_proto())];
+                                if let Some(sp) = stored_setpoint(&self.settings, target) {
+                                    frames.push(build_set_setpoint_cmd(sp));
+                                }
+                                self.pause_poll_ticks = self.pause_ticks_for(frames.len());
                                 return Task::perform(
                                     async move {
-                                        let _ = dev.send(&build_mode_cmd(mode)).await;
-                                        if let Some(sp) = setpoint {
-                                            let _ = dev.send(&build_set_setpoint_cmd(sp)).await;
-                                        }
+                                        let _ = dev.send_sequence(&frames).await;
                                         Message::Noop
                                     },
                                     |m| m,
@@ -761,6 +785,10 @@ impl AppState {
                 DeviceEvent::FirmwareVersion(ver) => {
                     self.firmware_version = Some(ver);
                 }
+                DeviceEvent::CapCurrent(amps) => {
+                    debug!("device CAP discharge current: {amps} A");
+                    self.device_cap_current = Some(amps);
+                }
                 DeviceEvent::RawNotification(_) => {}
                 DeviceEvent::Disconnected => {
                     // If device is already None, this is a stale notification from
@@ -798,15 +826,20 @@ impl AppState {
                     // the mode command and the concurrent poll don't race on the
                     // same BLE characteristic (concurrent writes are often dropped).
                     self.pause_poll_ticks = 3;
-                    let mode = mk.to_proto();
-                    let setpoint = stored_setpoint(&self.settings, mk);
+                    let mut frames = vec![build_mode_cmd(mk.to_proto())];
+                    // Also send the stored setpoint so device uses our value.
+                    if let Some(sp) = stored_setpoint(&self.settings, mk) {
+                        frames.push(build_set_setpoint_cmd(sp));
+                    }
+                    // CAP's discharge current never appears in the status
+                    // packet, so it must be requested explicitly to be shown.
+                    if mk == ModeKind::CAP {
+                        frames.push(CMD_GET_CAP_CURRENT.to_vec());
+                    }
+                    self.pause_poll_ticks = self.pause_ticks_for(frames.len());
                     return Task::perform(
                         async move {
-                            let _ = dev.send(&build_mode_cmd(mode)).await;
-                            // Also send the stored setpoint so device uses our value
-                            if let Some(sp) = setpoint {
-                                let _ = dev.send(&build_set_setpoint_cmd(sp)).await;
-                            }
+                            let _ = dev.send_sequence(&frames).await;
                             Message::Noop
                         },
                         |m| m,
@@ -851,40 +884,51 @@ impl AppState {
                 info!("toggle load -> {}", if want_on {"ON"} else {"OFF"});
                 let bytes = if want_on { CMD_LOAD_ON } else { CMD_LOAD_OFF };
                 if let Some(dev) = self.device.clone() {
-                    // Pause polls so the load command doesn't race on the
-                    // same BLE characteristic (same as SetMode).
-                    self.pause_poll_ticks = 3;
-                    // When turning load ON, re-send mode + setpoint to ensure
-                    // the device uses the user-selected mode (guards against
-                    // a lost earlier mode command).
-                    let mode_cmd = if want_on {
-                        Some(build_mode_cmd(self.settings.last_mode.to_proto()))
-                    } else {
-                        None
-                    };
-                    // When turning load ON, parse text input (user may not have pressed Set)
-                    let setpoint = if want_on {
-                        let mode = self.settings.last_mode;
-                        if let Ok(v) = self.setpoint_input.parse::<f32>() {
-                            let v = clamp_setpoint(mode, v);
-                            store_setpoint(&mut self.settings, mode, v);
-                            let _ = settings::save(&self.settings);
-                            Some(v)
-                        } else {
-                            stored_setpoint(&self.settings, mode)
+                    let mode = self.settings.last_mode;
+                    let mut frames: Vec<Vec<u8>> = Vec::new();
+                    if want_on {
+                        // Re-send mode + parameter to ensure the device uses the
+                        // user-selected mode (guards against a lost earlier
+                        // mode command).
+                        frames.push(build_mode_cmd(mode.to_proto()));
+                        match mode {
+                            // CC/CV/CR/CP: the setpoint may not have been
+                            // applied yet, so take it from the text input.
+                            ModeKind::CC | ModeKind::CV | ModeKind::CR | ModeKind::CP => {
+                                let sp = match self.setpoint_input.parse::<f32>() {
+                                    Ok(v) => {
+                                        let v = clamp_setpoint(mode, v);
+                                        store_setpoint(&mut self.settings, mode, v);
+                                        let _ = settings::save(&self.settings);
+                                        Some(v)
+                                    }
+                                    Err(_) => stored_setpoint(&self.settings, mode),
+                                };
+                                if let Some(sp) = sp {
+                                    frames.push(build_set_setpoint_cmd(sp));
+                                }
+                            }
+                            // CAP has its own opcode. Sending the ordinary
+                            // setpoint here used to push a stale value from
+                            // `setpoint_input` that the device silently ignores,
+                            // wasting a slot in the burst and costing the load
+                            // command its turn.
+                            ModeKind::CAP => {
+                                if let Ok(a) = self.settings.cap.current_input.parse::<f32>() {
+                                    frames.push(build_set_cap_current_cmd(a));
+                                }
+                            }
+                            // DCR takes its parameters from the front panel.
+                            ModeKind::DCR => {}
                         }
-                    } else {
-                        None
-                    };
+                    }
+                    frames.push(bytes.to_vec());
+                    // Pause polls so the burst doesn't race one on the same
+                    // characteristic (same as SetMode).
+                    self.pause_poll_ticks = self.pause_ticks_for(frames.len());
                     return Task::perform(
                         async move {
-                            if let Some(cmd) = mode_cmd {
-                                let _ = dev.send(&cmd).await;
-                            }
-                            if let Some(sp) = setpoint {
-                                let _ = dev.send(&build_set_setpoint_cmd(sp)).await;
-                            }
-                            let _ = dev.send(&bytes).await;
+                            let _ = dev.send_sequence(&frames).await;
                             Message::Noop
                         },
                         |m| m,
@@ -1178,8 +1222,37 @@ impl AppState {
                 let _ = settings::save(&self.settings);
             }
             Message::CapCutoffChanged(v) => {
+                // Local note only — the device has no BLE command for the CAP
+                // cutoff voltage, so this value is never transmitted.
                 self.settings.cap.cutoff_input = v;
                 let _ = settings::save(&self.settings);
+            }
+            Message::CapCurrentChanged(v) => {
+                self.settings.cap.current_input = v;
+            }
+            Message::ApplyCapCurrent => {
+                let Ok(amps) = self.settings.cap.current_input.parse::<f32>() else {
+                    return Task::none();
+                };
+                let amps = amps.clamp(0.0, CAP_CURRENT_MAX_A);
+                self.settings.cap.current_input = format!("{amps:.3}");
+                let _ = settings::save(&self.settings);
+                if let Some(dev) = self.device.clone() {
+                    // Write, then read straight back: the device quantises to
+                    // milliamps, so the stored value is the truth.
+                    let frames = vec![
+                        build_set_cap_current_cmd(amps),
+                        CMD_GET_CAP_CURRENT.to_vec(),
+                    ];
+                    self.pause_poll_ticks = self.pause_ticks_for(frames.len());
+                    return Task::perform(
+                        async move {
+                            let _ = dev.send_sequence(&frames).await;
+                            Message::Noop
+                        },
+                        |m| m,
+                    );
+                }
             }
             Message::CapRecordClear => {
                 self.samples.clear();
@@ -1217,12 +1290,15 @@ impl AppState {
                 let _ = settings::save(&self.settings);
             }
             Message::DcrStart => {
-                // DCR mode: ensure mode is set, then enable load to start test
+                // DCR mode: ensure mode is set, then enable load to start test.
                 if let Some(dev) = self.device.clone() {
+                    // Paced: sent back-to-back, the load command is dropped and
+                    // the test never starts until the button is pressed again.
+                    let frames = vec![build_mode_cmd(Mode::DCR), CMD_LOAD_ON.to_vec()];
+                    self.pause_poll_ticks = self.pause_ticks_for(frames.len());
                     return Task::perform(
                         async move {
-                            let _ = dev.send(&build_mode_cmd(Mode::DCR)).await;
-                            let _ = dev.send(&CMD_LOAD_ON).await;
+                            let _ = dev.send_sequence(&frames).await;
                             Message::Noop
                         },
                         |m| m,
@@ -1842,73 +1918,141 @@ impl AppState {
         }
         match self.settings.last_mode {
             ModeKind::CAP => {
-                let timer_btn_label = if self.settings.cap.timer_enabled { t!("btn.disable").to_string() } else { t!("btn.enable").to_string() };
-                let timer_state = if self.settings.cap.timer_enabled { t!("btn.load_on").to_string() } else { t!("btn.load_off").to_string() };
+                // Of the device's CAP parameters, only the discharge current is
+                // reachable over BLE (write `0x05`, read `0x0A`).  Verified on
+                // HW:2.0 / SW:1.7 — see `docs/BT_PROTOCOL.md`.
+                //
+                // The cutoff voltage and the timer have **no** BLE command at
+                // all: every opcode in the device's command space was probed and
+                // none of them writes either value.  The editors for them are
+                // commented out below rather than deleted, so they can be
+                // restored the day a firmware revision exposes them.  Leaving
+                // them enabled was the original bug — they looked like device
+                // controls but were never transmitted anywhere.
 
-                // Line 1: Timer toggle + Duration (only shown when timer enabled)
-                let mut timer_row = row![
-                    text(format!("{}:", t!("label.timer"))).size(12),
-                    text(timer_state).size(12),
-                    Space::new().width(8.0),
-                    button(text(timer_btn_label).size(11))
-                        .padding([3, 8])
-                        .on_press(Message::CapTimerToggle),
-                ].spacing(6).align_y(iced::Alignment::Center);
-
-                if self.settings.cap.timer_enabled {
-                    timer_row = timer_row.push(Space::new().width(16.0));
-                    timer_row = timer_row.push(text(format!("{}:", t!("label.duration"))).size(12));
-                    timer_row = timer_row.push(
-                        text_input("01:00:00", &self.settings.cap.timer_input)
-                            .on_input(Message::CapTimerChanged)
-                            .width(Length::Fixed(90.0))
-                            .size(13),
-                    );
+                // Line 1: discharge current — editable, and actually sent.
+                let current_valid = self
+                    .settings
+                    .cap
+                    .current_input
+                    .parse::<f32>()
+                    .is_ok_and(|a| (0.0..=CAP_CURRENT_MAX_A).contains(&a));
+                let mut set_current_btn =
+                    button(text(t!("btn.set")).size(11)).padding([3, 8]);
+                if current_valid && self.device.is_some() {
+                    set_current_btn = set_current_btn.on_press(Message::ApplyCapCurrent);
                 }
-
-                // Line 2: Cutoff V + Chemistry + Cells
-                let chemistry_display = if self.settings.cap.chemistry.is_empty() {
-                    t!("label.na").to_string()
-                } else {
-                    self.settings.cap.chemistry.clone()
-                };
-
-                let has_chemistry = !self.settings.cap.chemistry.is_empty()
-                    && self.settings.cap.chemistry != t!("label.na").as_ref();
-
-                let mut cutoff_row = row![
-                    text(format!("{}:", t!("label.cutoff_v"))).size(12),
-                    text_input("3.0", &self.settings.cap.cutoff_input)
-                        .on_input(Message::CapCutoffChanged)
-                        .width(Length::Fixed(60.0))
+                let current_row = row![
+                    text(format!("{}:", t!("label.discharge_current"))).size(12),
+                    text_input("1.000", &self.settings.cap.current_input)
+                        .on_input(Message::CapCurrentChanged)
+                        .on_submit(Message::ApplyCapCurrent)
+                        .width(Length::Fixed(70.0))
                         .size(13),
-                    text("V").size(12),
-                    Space::new().width(16.0),
-                    text(format!("{}:", t!("label.chemistry_type"))).size(12),
-                    pick_list(
-                        chemistry_names(),
-                        Some(chemistry_display),
-                        Message::CapChemistryChanged,
-                    ).text_size(12),
-                ].spacing(6).align_y(iced::Alignment::Center);
+                    text("A").size(12),
+                    set_current_btn,
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
 
-                if has_chemistry {
-                    let cells_str = self.settings.cap.cells.to_string();
-                    let cells_selected = Some(&cells_str);
-                    cutoff_row = cutoff_row.push(Space::new().width(12.0));
-                    cutoff_row = cutoff_row.push(
-                        combo_box(&self.cells_combo_state, "#", cells_selected, Message::CapCellsChanged)
-                            .on_input(Message::CapCellsChanged)
-                            .width(Length::Fixed(75.0))
-                            .size(13.0),
-                    );
-                }
+                // Line 2: the parameters the protocol cannot reach.
+                let device_only_row = row![
+                    text(format!(
+                        "{}: {}",
+                        t!("label.cap_device_only"),
+                        t!("label.device_only_hint")
+                    ))
+                    .size(11),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
+
+                // // Line 3: what the device actually holds, read back after every
+                // // write.  On its own line rather than beside the input, so the
+                // // editable value and the device's value are not confused.
+                // let on_device_row = row![
+                //     text(match self.device_cap_current {
+                //         Some(a) => format!(
+                //             "{}: {:.3} A ({:.0} mA)",
+                //             t!("label.on_device"),
+                //             a,
+                //             a * 1000.0
+                //         ),
+                //         None => format!("{}: —", t!("label.on_device")),
+                //     })
+                //     .size(12),
+                // ]
+                // .spacing(6)
+                // .align_y(iced::Alignment::Center);
+
+                // ---- Not sendable over BLE — kept for a future firmware ----
+                //
+                // let timer_btn_label = if self.settings.cap.timer_enabled { t!("btn.disable").to_string() } else { t!("btn.enable").to_string() };
+                // let timer_state = if self.settings.cap.timer_enabled { t!("btn.load_on").to_string() } else { t!("btn.load_off").to_string() };
+                //
+                // let mut timer_row = row![
+                //     text(format!("{}:", t!("label.timer"))).size(12),
+                //     text(timer_state).size(12),
+                //     Space::new().width(8.0),
+                //     button(text(timer_btn_label).size(11))
+                //         .padding([3, 8])
+                //         .on_press(Message::CapTimerToggle),
+                // ].spacing(6).align_y(iced::Alignment::Center);
+                //
+                // if self.settings.cap.timer_enabled {
+                //     timer_row = timer_row.push(Space::new().width(16.0));
+                //     timer_row = timer_row.push(text(format!("{}:", t!("label.duration"))).size(12));
+                //     timer_row = timer_row.push(
+                //         text_input("01:00:00", &self.settings.cap.timer_input)
+                //             .on_input(Message::CapTimerChanged)
+                //             .width(Length::Fixed(90.0))
+                //             .size(13),
+                //     );
+                // }
+                //
+                // let chemistry_display = if self.settings.cap.chemistry.is_empty() {
+                //     t!("label.na").to_string()
+                // } else {
+                //     self.settings.cap.chemistry.clone()
+                // };
+                //
+                // let has_chemistry = !self.settings.cap.chemistry.is_empty()
+                //     && self.settings.cap.chemistry != t!("label.na").as_ref();
+                //
+                // let mut cutoff_row = row![
+                //     text(format!("{}:", t!("label.cutoff_v"))).size(12),
+                //     text_input("3.0", &self.settings.cap.cutoff_input)
+                //         .on_input(Message::CapCutoffChanged)
+                //         .width(Length::Fixed(60.0))
+                //         .size(13),
+                //     text("V").size(12),
+                //     Space::new().width(16.0),
+                //     text(format!("{}:", t!("label.chemistry_type"))).size(12),
+                //     pick_list(
+                //         chemistry_names(),
+                //         Some(chemistry_display),
+                //         Message::CapChemistryChanged,
+                //     ).text_size(12),
+                // ].spacing(6).align_y(iced::Alignment::Center);
+                //
+                // if has_chemistry {
+                //     let cells_str = self.settings.cap.cells.to_string();
+                //     let cells_selected = Some(&cells_str);
+                //     cutoff_row = cutoff_row.push(Space::new().width(12.0));
+                //     cutoff_row = cutoff_row.push(
+                //         combo_box(&self.cells_combo_state, "#", cells_selected, Message::CapCellsChanged)
+                //             .on_input(Message::CapCellsChanged)
+                //             .width(Length::Fixed(75.0))
+                //             .size(13.0),
+                //     );
+                // }
 
                 container(
                     column![
                         text(t!("label.cap_params").to_string()).size(13),
-                        timer_row,
-                        cutoff_row,
+                        current_row,
+                        device_only_row,
+                        // on_device_row,
                     ]
                     .spacing(6),
                 )
@@ -1918,32 +2062,40 @@ impl AppState {
                 .into()
             }
             ModeKind::DCR => {
+                // Like the CAP cutoff, the DCR test currents and timer have no
+                // BLE command — they are front-panel settings (manual §3.4.2,
+                // "DCR Params").  Verified on HW:2.0 / SW:1.7: neither `0x04`
+                // nor `0x05` moves them, and they are the only writable opcodes
+                // whose payload shape is known.  The editors below are commented
+                // out rather than deleted; see `docs/BT_PROTOCOL.md`.
+                //
+                // They *are* readable, though: the status packet reports both
+                // test currents in DCR mode, so show what the device holds.
+                let (i1, i2) = match self.last_status.as_ref() {
+                    Some(st) => (
+                        format!("{:.0} mA", st.dcr_i1 * 1000.0),
+                        format!("{:.0} mA", st.dcr_i2 * 1000.0),
+                    ),
+                    None => ("—".to_string(), "—".to_string()),
+                };
+
                 container(
                     column![
                         text(t!("label.dcr_params").to_string()).size(13),
+                        // Same order as the CAP panel: the device-only notice
+                        // first, then the read-back values on their own line.
+                        text(format!(
+                            "{}: {}",
+                            t!("label.dcr_device_only"),
+                            t!("label.device_only_hint")
+                        )).size(11),
                         row![
-                            text("I1: ").size(12),
-                            text_input("20", &self.settings.dcr.i1_input)
-                                .on_input(Message::DcrI1Changed)
-                                .width(Length::Fixed(40.0))
-                                .size(13),
-                            text("mA").size(12),
-                            Space::new().width(12.0),
-                            text("I2: ").size(12),
-                            text_input("1000", &self.settings.dcr.i2_input)
-                                .on_input(Message::DcrI2Changed)
-                                .width(Length::Fixed(60.0))
-                                .size(13),
-                            text("mA").size(12)
+                            text(format!("{}:", t!("label.on_device"))).size(12),
+                            Space::new().width(6.0),
+                            text(format!("I1: {i1}")).size(12),
+                            Space::new().width(16.0),
+                            text(format!("I2: {i2}")).size(12),
                         ].align_y(iced::Alignment::Center),
-                        row![
-                            text(format!("{}:", t!("label.timer"))).size(12),
-                            text_input("2", &self.settings.dcr.timer_input)
-                                .on_input(Message::DcrTimerChanged)
-                                .width(Length::Fixed(30.0))
-                                .size(13),
-                            text("s").size(12),
-                        ].spacing(6).align_y(iced::Alignment::Center),
                     ]
                     .spacing(6),
                 )
@@ -1951,6 +2103,32 @@ impl AppState {
                 .style(container::bordered_box)
                 .width(Length::Fill)
                 .into()
+
+                // ---- Not sendable over BLE — kept for a future firmware ----
+                //
+                // row![
+                //     text("I1: ").size(12),
+                //     text_input("20", &self.settings.dcr.i1_input)
+                //         .on_input(Message::DcrI1Changed)
+                //         .width(Length::Fixed(40.0))
+                //         .size(13),
+                //     text("mA").size(12),
+                //     Space::new().width(12.0),
+                //     text("I2: ").size(12),
+                //     text_input("1000", &self.settings.dcr.i2_input)
+                //         .on_input(Message::DcrI2Changed)
+                //         .width(Length::Fixed(60.0))
+                //         .size(13),
+                //     text("mA").size(12)
+                // ].align_y(iced::Alignment::Center),
+                // row![
+                //     text(format!("{}:", t!("label.timer"))).size(12),
+                //     text_input("2", &self.settings.dcr.timer_input)
+                //         .on_input(Message::DcrTimerChanged)
+                //         .width(Length::Fixed(30.0))
+                //         .size(13),
+                //     text("s").size(12),
+                // ].spacing(6).align_y(iced::Alignment::Center),
             }
             _ => Space::new().height(0.0).into(),
         }
@@ -2598,6 +2776,9 @@ const CHEMISTRY_TYPES: &[(&str, f32)] = &[
     ("Na-Ion", 2.00),
 ];
 
+/// Retained for the commented-out CAP chemistry selector — see
+/// `battery_params_panel`. The cutoff voltage it derives has no BLE command.
+#[allow(dead_code)]
 fn chemistry_names() -> Vec<String> {
     let mut v = vec![t!("label.na").to_string()];
     v.extend(CHEMISTRY_TYPES.iter().map(|(name, _)| name.to_string()));
@@ -2697,6 +2878,7 @@ mod tests {
             chart_height: 160.0,
             graph_time_input: time_window_str,
             graph_retention_input: retention_str,
+            device_cap_current: None,
             graph_start_time: None,
             cells_combo_state: combo_box::State::new(
                 (1u8..=20).map(|n| n.to_string()).collect(),
@@ -2966,6 +3148,117 @@ mod tests {
             "Sample grew to {} bytes",
             std::mem::size_of::<Sample>()
         );
+    }
+
+    /// The CAP discharge current is the one CAP parameter the protocol can
+    /// write, so the input must normalise and clamp to the device's range.
+    #[test]
+    fn cap_current_is_normalised_and_clamped_on_apply() {
+        let mut state = test_state();
+
+        state.settings.cap.current_input = "2.5".to_string();
+        let _ = state.update(Message::ApplyCapCurrent);
+        assert_eq!(state.settings.cap.current_input, "2.500");
+
+        state.settings.cap.current_input = "99".to_string();
+        let _ = state.update(Message::ApplyCapCurrent);
+        assert_eq!(state.settings.cap.current_input, "12.000");
+
+        state.settings.cap.current_input = "-3".to_string();
+        let _ = state.update(Message::ApplyCapCurrent);
+        assert_eq!(state.settings.cap.current_input, "0.000");
+    }
+
+    #[test]
+    fn cap_current_apply_ignores_unparseable_input() {
+        let mut state = test_state();
+        state.settings.cap.current_input = "abc".to_string();
+        let _ = state.update(Message::ApplyCapCurrent);
+        // Left untouched rather than silently coerced to 0 A.
+        assert_eq!(state.settings.cap.current_input, "abc");
+    }
+
+    /// The device only reports this value when asked; it is never in a status
+    /// packet, so the readback has to come from the dedicated event.
+    #[test]
+    fn cap_current_event_updates_the_readback() {
+        let mut state = test_state();
+        assert!(state.device_cap_current.is_none());
+        let _ = state.update(Message::DeviceEvent(DeviceEvent::CapCurrent(5.000001)));
+        assert_eq!(state.device_cap_current, Some(5.000001));
+    }
+
+    /// Regression guard for the original bug: the cutoff voltage is a local
+    /// note only, so changing it must not produce any device traffic.
+    #[test]
+    fn cap_cutoff_is_local_only() {
+        let mut state = test_state();
+        let _ = state.update(Message::CapCutoffChanged("2.8".to_string()));
+        assert_eq!(state.settings.cap.cutoff_input, "2.8");
+        // No device is connected in tests; the point is that no send path
+        // exists for it at all — `stored_setpoint` also refuses CAP.
+        assert!(stored_setpoint(&state.settings, ModeKind::CAP).is_none());
+    }
+
+    /// A burst must stay paused for at least as long as it takes to drain,
+    /// otherwise a poll lands in the middle of it and becomes the very
+    /// back-to-back write the inter-command gap exists to avoid.
+    #[test]
+    fn poll_pause_covers_the_whole_burst() {
+        let mut state = test_state();
+        let gap_ms = INTER_COMMAND_GAP.as_millis() as u64;
+
+        for interval in [50_u64, 100, 200, 500, 1000] {
+            state.settings.poll_interval_ms = interval;
+            for frames in 1..=4_usize {
+                let ticks = state.pause_ticks_for(frames) as u64;
+                let burst_ms = (frames as u64 - 1) * gap_ms;
+                assert!(
+                    ticks * interval >= burst_ms,
+                    "interval {interval}ms, {frames} frames: paused {}ms < burst {burst_ms}ms",
+                    ticks * interval
+                );
+                assert!(ticks >= 1, "must always skip at least one poll");
+            }
+        }
+    }
+
+    /// Regression guard for the multiple-clicks bug: in CAP mode the load-on
+    /// burst used to carry a stale `0x04` setpoint that the device ignores,
+    /// which cost the load command its slot in the burst.
+    #[test]
+    fn cap_load_on_burst_uses_the_cap_opcode_not_the_setpoint() {
+        let settings = Settings::default();
+        // What the old code would have sent for CAP: a setpoint from the text
+        // input. `stored_setpoint` already refuses CAP — the bug was that
+        // ToggleLoad bypassed it by parsing `setpoint_input` directly.
+        assert!(stored_setpoint(&settings, ModeKind::CAP).is_none());
+        assert!(stored_setpoint(&settings, ModeKind::DCR).is_none());
+
+        // The CAP parameter frame must be the 0x05 opcode, not 0x04.
+        let cap_frame = build_set_cap_current_cmd(5.0);
+        assert_eq!(cap_frame[3], 0x05);
+        let setpoint_frame = build_set_setpoint_cmd(5.0);
+        assert_eq!(setpoint_frame[3], 0x04);
+        assert_ne!(cap_frame, setpoint_frame);
+    }
+
+    /// DCR's test currents and timer have no BLE command, so nothing in the
+    /// DCR path may send a parameter frame. `stored_setpoint` refusing DCR is
+    /// what `ToggleLoad` now relies on; the panel itself is read-only.
+    #[test]
+    fn dcr_params_are_never_sent() {
+        let mut state = test_state();
+        let _ = state.update(Message::DcrI1Changed("50".to_string()));
+        let _ = state.update(Message::DcrI2Changed("500".to_string()));
+        let _ = state.update(Message::DcrTimerChanged("3".to_string()));
+
+        // Retained as local notes...
+        assert_eq!(state.settings.dcr.i1_input, "50");
+        assert_eq!(state.settings.dcr.i2_input, "500");
+        assert_eq!(state.settings.dcr.timer_input, "3");
+        // ...but there is no send path for them.
+        assert!(stored_setpoint(&state.settings, ModeKind::DCR).is_none());
     }
 
     #[test]

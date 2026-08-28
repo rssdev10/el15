@@ -123,6 +123,7 @@ async fn try_connect(args: &Cli, state: &SharedState) -> Result<Arc<Device>> {
             match ev {
                 DeviceEvent::Status(s) => st_clone.update_status(s).await,
                 DeviceEvent::FirmwareVersion(ver) => info!("firmware version: {ver}"),
+                DeviceEvent::CapCurrent(amps) => info!("CAP discharge current: {amps} A"),
                 DeviceEvent::RawNotification(_) => {}
                 DeviceEvent::Disconnected => {
                     warn!("device disconnected");
@@ -219,6 +220,9 @@ async fn run_debug_shell(args: &Cli) -> Result<()> {
                 }
                 DeviceEvent::FirmwareVersion(ver) => {
                     println!("  << FIRMWARE VERSION: {ver}");
+                }
+                DeviceEvent::CapCurrent(amps) => {
+                    println!("  << CAP DISCHARGE CURRENT: {amps:.4} A ({:.0} mA)", amps * 1000.0);
                 }
                 DeviceEvent::Disconnected => {
                     println!("  << DISCONNECTED");

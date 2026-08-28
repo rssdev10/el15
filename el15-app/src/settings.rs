@@ -108,6 +108,12 @@ impl Default for GraphSettings {
     }
 }
 
+/// Capacity-test settings.
+///
+/// Only `current_input` reaches the device. The BLE protocol exposes the CAP
+/// discharge current (write `0x05`, read `0x0A`) but has **no** command for the
+/// cutoff voltage or the timer — those are front-panel settings. The remaining
+/// fields are therefore kept as local notes only; see `docs/BT_PROTOCOL.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapSettings {
     pub timer_enabled: bool,
@@ -117,9 +123,14 @@ pub struct CapSettings {
     pub chemistry: String,
     #[serde(default = "default_cells")]
     pub cells: u8,
+    /// Discharge current in Amps, as typed by the user. Sent to the device.
+    #[serde(default = "default_cap_current")]
+    pub current_input: String,
 }
 
 fn default_cells() -> u8 { 1 }
+
+fn default_cap_current() -> String { "1.000".to_string() }
 
 impl Default for CapSettings {
     fn default() -> Self {
@@ -129,6 +140,7 @@ impl Default for CapSettings {
             cutoff_input: "3.0".to_string(),
             chemistry: String::new(),
             cells: 1,
+            current_input: default_cap_current(),
         }
     }
 }

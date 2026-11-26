@@ -1859,7 +1859,9 @@ impl AppState {
                 column![runtime_card, cap_card, energy_card].spacing(6).into()
             }
             ModeKind::DCR => {
-                let temp_card = info_card(&lbl_temperature, &format!("{:.2} °C", st.temperature));
+                // DCR packets carry the test currents where the temperature
+                // usually is; there is no reading to show.
+                let temp_card = info_card(&lbl_temperature, "---");
                 let dcr_card = info_card(&lbl_resistance, &format!("{:.1} mΩ", st.dcr_mohm));
                 column![runtime_card, temp_card, dcr_card].spacing(6).into()
             }

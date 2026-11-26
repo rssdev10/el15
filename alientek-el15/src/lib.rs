@@ -7,13 +7,24 @@
 //! [docs/BT_PROTOCOL.md](https://github.com/rssdev10/el15/blob/main/docs/BT_PROTOCOL.md).
 //!
 //! - [`protocol`]: command frames, the checksum, and parsers for the device's replies.
-//! - [`device`]: scanning, connecting, and a [`Device`] handle that sends commands and
-//!   turns notifications into [`DeviceEvent`]s.
+//! - `device` (feature `ble`): scanning, connecting, and a `Device` handle that sends
+//!   commands and turns notifications into `DeviceEvent`s.
+//!
+//! ## Cargo features
+//!
+//! - `ble` (default): Bluetooth LE through `btleplug` — `scan_devices`, `Device::connect`
+//!   and the notification pump. Without it the crate keeps the command frames, the checksum
+//!   and the reply parsers, and needs no Bluetooth stack or async runtime to build.
+//! - `serde`: `Serialize`/`Deserialize` for [`Status`], [`Mode`], [`Warning`] and
+//!   [`FirmwareVersion`].
 
 pub mod protocol;
+#[cfg(feature = "ble")]
 pub mod device;
+#[cfg(feature = "ble")]
 pub mod error;
 
+#[cfg(feature = "ble")]
 pub use error::{Error, Result};
 pub use protocol::{
     Status, Mode, Warning, FirmwareVersion, ParseError,
@@ -22,9 +33,10 @@ pub use protocol::{
     CAP_CURRENT_MAX_A, FAN_SPEED_MAX,
     build_set_setpoint_cmd, build_set_cap_current_cmd, build_mode_cmd,
     parse_status_packet, parse_cap_current, checksum,
-    parse_firmware_version,
+    parse_firmware_version, INTER_COMMAND_GAP,
 };
+#[cfg(feature = "ble")]
 pub use device::{
     scan_devices, scan_devices_with, scan_for_device, Device, DeviceEvent, DeviceInfo, ScanOptions,
-    SERVICE_UUID, INTER_COMMAND_GAP,
+    SERVICE_UUID,
 };

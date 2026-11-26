@@ -3,6 +3,7 @@
 //! All numeric framing is little-endian.
 
 use std::fmt;
+use std::time::Duration;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,22 @@ pub const CMD_GET_CAP_CURRENT: [u8; 6] = [0xAF, 0x07, 0x03, 0x0A, 0x00, 0x3D];
 
 /// Header of the CAP discharge-current response.
 pub const CAP_CURRENT_HEADER: [u8; 5] = [0xDF, 0x07, 0x03, 0x0A, 0x04];
+
+/// Minimum gap between two consecutive command writes.
+///
+/// The write characteristic advertises WRITE_WITHOUT_RESPONSE, so `Device::send`
+/// (feature `ble`) uses it — and that has no flow control: frames written
+/// back-to-back are silently dropped, with no error on this side.
+///
+/// Measured on HW:2.0 / SW:1.7. Three commands sent with no gap (set mode, set
+/// setpoint, set CAP current) landed **none** of the trailing two — the CAP
+/// current read back unchanged three times running, and one reply came back
+/// corrupted (`df 01 04 39 …`, containing bytes of the outgoing frame). The
+/// same three spaced 120 ms apart took effect 3 times out of 3.
+///
+/// This is why a burst of commands used to need several button presses before
+/// one "took".
+pub const INTER_COMMAND_GAP: Duration = Duration::from_millis(120);
 
 /// Compute the checksum byte that makes `sum(packet) % 256 == 0`.
 pub fn checksum(data: &[u8]) -> u8 {

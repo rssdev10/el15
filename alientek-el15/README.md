@@ -11,6 +11,11 @@ Bluetooth LE. Not affiliated with or endorsed by ALIENTEK.
 - Scanning, connecting, and a `Device` handle that sends commands and turns notifications
   into `DeviceEvent`s.
 
+Cargo feature `ble` (default) brings Bluetooth LE through `btleplug`. With
+`default-features = false` the crate builds without a Bluetooth stack or async runtime and
+keeps the command frames, the checksum and the reply parsers, for use over your own link.
+Feature `serde` adds `Serialize`/`Deserialize` to the status and version types.
+
 The protocol was reverse-engineered from the Bluetooth traffic of ALIENTEK's official
 Android app, ATK-xTOOL, and cross-checked against the Python project DM40GUI. Verified
 against an EL15 with hardware 2.0 and firmware 1.7. The full description, with the evidence

@@ -27,7 +27,7 @@ use uuid::{uuid, Uuid};
 use crate::error::{Error, Result};
 use crate::protocol::{
     parse_cap_current, parse_status_packet, parse_firmware_version, FirmwareVersion, Status,
-    STATUS_HEADER, POLL_PKT, CMD_INIT, CMD_INFO, CMD_GET_CAP_CURRENT,
+    STATUS_HEADER, POLL_PKT, CMD_INIT, CMD_INFO, CMD_GET_CAP_CURRENT, INTER_COMMAND_GAP,
 };
 
 const SCAN_DURATION: Duration = Duration::from_secs(5);
@@ -35,22 +35,6 @@ const SCAN_DURATION: Duration = Duration::from_secs(5);
 /// GATT service UUID exposed by ALIENTEK EL15 (short UUID 0xFFF0).
 /// The writable and notify characteristics live under this service.
 pub const SERVICE_UUID: Uuid = uuid!("0000fff0-0000-1000-8000-00805f9b34fb");
-
-/// Minimum gap between two consecutive command writes.
-///
-/// The write characteristic advertises WRITE_WITHOUT_RESPONSE, so [`Device::send`]
-/// uses it — and that has no flow control: frames written back-to-back are
-/// silently dropped, with no error on this side.
-///
-/// Measured on HW:2.0 / SW:1.7. Three commands sent with no gap (set mode, set
-/// setpoint, set CAP current) landed **none** of the trailing two — the CAP
-/// current read back unchanged three times running, and one reply came back
-/// corrupted (`df 01 04 39 …`, containing bytes of the outgoing frame). The
-/// same three spaced 120 ms apart took effect 3 times out of 3.
-///
-/// This is why a burst of commands used to need several button presses before
-/// one "took".
-pub const INTER_COMMAND_GAP: Duration = Duration::from_millis(120);
 
 /// Friendly name prefixes used as a fallback when advertisement data does not
 /// carry the service UUID list (some BT stacks strip 128-bit UUIDs from the

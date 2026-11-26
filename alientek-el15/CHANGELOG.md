@@ -42,3 +42,7 @@ Compared with `el15-bt` 0.1.4:
 - `Error` is `#[non_exhaustive]` and keeps only the variants the crate returns:
   `Bluetooth`, `NoAdapter`, `CharacteristicNotFound`.
 - New exports: `STATUS_LEN`, `CAP_CURRENT_HEADER`, `FAN_SPEED_MAX`.
+- Bluetooth LE is the default feature `ble`; without it the crate needs no Bluetooth stack or
+  async runtime and depends only on `thiserror`. `INTER_COMMAND_GAP` moved to `protocol` and
+  is available either way.
+- `serde` is no longer a default feature.

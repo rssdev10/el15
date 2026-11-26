@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(DeviceEvent::Status(s)) => {
                         println!(
                             "{:<4} {:7.3} V {:7.3} A {:7.2} W {:5.1} °C load {}",
-                            s.mode_name,
+                            s.mode().map_or("?", |m| m.as_str()),
                             s.voltage,
                             s.current,
                             s.power,

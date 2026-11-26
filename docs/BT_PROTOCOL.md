@@ -15,7 +15,7 @@ The Rust implementation is the [`alientek-el15`](../alientek-el15/README.md) cra
 
       0000fff0-0000-1000-8000-00805f9b34fb
 
-  This is exported as `alientek_el15::EL15_SERVICE_UUID`. On Linux/Windows it is
+  This is exported as `alientek_el15::SERVICE_UUID`. On Linux/Windows it is
   used as a BLE scan filter; on macOS CoreBluetooth does not match this UUID
   in passive scan so discovery falls back to device-name prefix matching
   (`EL15`, `ATK-PTEL15`, `ALIENTEK`, etc.).
@@ -84,7 +84,7 @@ the init sequence to wake the device from dormant state:
 Without this handshake the device reports zeros for temperature, setpoint,
 and runtime in status packets.
 
-Implementation: `El15Device::init_handshake()`.
+Implementation: `Device::init_handshake()`.
 
 ## Frames
 
@@ -125,7 +125,7 @@ Observed from HCI log: `DF FF FF 00 02 07 03 17`
 | 5–6    | `07 03`| reserved    | Protocol version or device sub-type                 |
 | 7      | `17`   | sw_byte     | Normal BCD: major = high nibble, minor = low nibble. `0x17` → SW 1.7. Also satisfies checksum (sum of all 8 bytes ≡ 0 mod 256) |
 
-Implementation: `alientek_el15::parse_firmware_version(data)` → `Some("HW:2.0 SW:1.7")` for the example above.
+Implementation: `alientek_el15::parse_firmware_version(data)` → `Some(FirmwareVersion { hw_major: 2, hw_minor: 0, sw_major: 1, sw_minor: 7 })` for the example above, displayed as `HW:2.0 SW:1.7`. A packet with a wrong checksum gives `None`.
 
 > **Implementation note:** btleplug uses an internal `broadcast::channel` for notifications. The
 > notification stream receiver must be obtained (via `peripheral.notifications().await`) *before*
@@ -218,8 +218,8 @@ The `alientek-el15` library emits these events from the notification stream:
 
 | Variant                      | Trigger                                               |
 | ---------------------------- | ----------------------------------------------------- |
-| `Status(EL15Status)`         | Any 28-byte notification with header `DF 07 03 08`    |
-| `FirmwareVersion(String)`    | Init response with header `DF FF FF`; parsed by `parse_firmware_version` |
+| `Status(Status)`             | 28-byte notification with header `DF 07 03 08` and a valid checksum; `parse_status_packet` returns a `ParseError` otherwise and the packet only appears as `RawNotification` |
+| `FirmwareVersion(FirmwareVersion)` | Init response with header `DF FF FF`; parsed by `parse_firmware_version` |
 | `CapCurrent(f32)`            | CAP discharge-current reply `DF 07 03 0A 04 <f32>`, in Amps |
 | `RawNotification(Vec<u8>)`   | Every notification, unfiltered (for debugging)        |
 | `Disconnected`               | GATT notification stream ends                         |
@@ -325,8 +325,8 @@ Acknowledgement status byte (`DF 07 03 <cmd> 01 <status>`):
   `Device::connect` picks the first writable/notifying characteristic on the
   `FFF0` service rather than a fixed UUID. No command has been found that works
   on one characteristic but not the other.
-- **DCR mode** auto-stops after measurement completes. The `dcr_mohm` field
-  reports resistance in **Ohms** (not milliohms despite the field name).
+- **DCR mode** auto-stops after measurement completes. The `dcr_ohm` field
+  reports resistance in **Ohms** (bytes 23..27, f32).
 - **Android BLE MTU:** On Android, 28-byte status notifications may arrive
   fragmented as 20+8 byte chunks. On macOS, they arrive as a single 28-byte
   notification.

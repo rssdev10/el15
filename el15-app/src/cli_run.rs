@@ -202,17 +202,18 @@ async fn run_debug_shell(args: &Cli) -> Result<()> {
             match ev {
                 DeviceEvent::Status(s) => {
                     let extra = if s.mode_byte == 0x0A {
-                        format!(" DCR: I1={:.1}mA I2={:.1}mA R={:.1}Ω", s.dcr_i1 * 1000.0, s.dcr_i2 * 1000.0, s.dcr_mohm)
+                        format!(" DCR: I1={:.1}mA I2={:.1}mA R={:.1}Ω", s.dcr_i1 * 1000.0, s.dcr_i2 * 1000.0, s.dcr_ohm)
                     } else if s.mode_byte == 0x02 {
                         format!(" CAP: {:.3}Ah {:.3}Wh", s.capacity_ah, s.energy_wh)
                     } else {
-                        format!(" set={:.4}{}", s.setpoint, s.setpoint_unit)
+                        format!(" set={:.4}{}", s.setpoint, s.mode().map_or("", |m| m.setpoint_info().0))
                     };
                     println!(
                         "  << STATUS: V={:.4} I={:.4} P={:.4} mode={} load={} fan={} T={:.1}°C rt={}s{} warn=\"{}\"",
                         s.voltage, s.current, s.power,
-                        s.mode_name, s.load_on, s.fan_speed,
-                        s.temperature, s.runtime_s, extra, s.warning,
+                        s.mode().map_or("?", Mode::as_str), s.load_on, s.fan_speed,
+                        s.temperature, s.runtime_s, extra,
+                        s.warning.map(|w| w.to_string()).unwrap_or_default(),
                     );
                 }
                 DeviceEvent::RawNotification(data) => {
@@ -343,7 +344,7 @@ async fn run_debug_shell(args: &Cli) -> Result<()> {
                 println!("  Device: {}", info.display_label());
                 println!("  Address: {}", info.address);
                 println!("  ID: {}", info.id);
-                println!("  Service UUID: {}", alientek_el15::EL15_SERVICE_UUID);
+                println!("  Service UUID: {}", alientek_el15::SERVICE_UUID);
                 println!("  Write char: {}", dev.write_char_uuid());
                 println!("  Notify char: {}", dev.notify_char_uuid());
             }

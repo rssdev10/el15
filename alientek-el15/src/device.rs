@@ -26,15 +26,15 @@ use uuid::{uuid, Uuid};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    parse_cap_current, parse_status_packet, parse_firmware_version, EL15Status, HEADER, POLL_PKT,
-    CMD_INIT, CMD_INFO, CMD_GET_CAP_CURRENT,
+    parse_cap_current, parse_status_packet, parse_firmware_version, FirmwareVersion, Status,
+    STATUS_HEADER, POLL_PKT, CMD_INIT, CMD_INFO, CMD_GET_CAP_CURRENT,
 };
 
 const SCAN_DURATION: Duration = Duration::from_secs(5);
 
 /// GATT service UUID exposed by ALIENTEK EL15 (short UUID 0xFFF0).
 /// The writable and notify characteristics live under this service.
-pub const EL15_SERVICE_UUID: Uuid = uuid!("0000fff0-0000-1000-8000-00805f9b34fb");
+pub const SERVICE_UUID: Uuid = uuid!("0000fff0-0000-1000-8000-00805f9b34fb");
 
 /// Minimum gap between two consecutive command writes.
 ///
@@ -86,16 +86,21 @@ fn short_id(id: &str) -> String {
     suffix.chars().rev().collect::<String>().to_uppercase()
 }
 
+/// What the notification pump of a connected [`Device`] reports.
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
-    Status(EL15Status),
-    FirmwareVersion(String),
+    /// A valid status packet (checked length, header and checksum).
+    Status(Status),
+    /// The reply to the init handshake.
+    FirmwareVersion(FirmwareVersion),
     /// CAP discharge current in Amps, from a `DF 07 03 0A` response.
     ///
     /// Only emitted in reply to [`Device::request_cap_current`]; the device
     /// never reports this value in the periodic status packet.
     CapCurrent(f32),
+    /// Every notification, unfiltered, including those that failed to parse.
     RawNotification(Vec<u8>),
+    /// The notification stream ended.
     Disconnected,
 }
 
@@ -139,7 +144,7 @@ pub async fn scan_for_device(target_id: &str, timeout: Duration) -> Result<Optio
     info!("quick-scan for known device {}", &target_id[..target_id.len().min(12)]);
 
     let filter = if !cfg!(target_os = "macos") {
-        ScanFilter { services: vec![EL15_SERVICE_UUID] }
+        ScanFilter { services: vec![SERVICE_UUID] }
     } else {
         ScanFilter::default()
     };
@@ -198,7 +203,7 @@ pub async fn scan_devices_with(opts: ScanOptions) -> Result<Vec<DeviceInfo>> {
         // the service UUID in their GATT table (not in advertisement data).
         // So we always scan unfiltered on Apple platforms and post-filter.
         ScanFilter {
-            services: vec![EL15_SERVICE_UUID],
+            services: vec![SERVICE_UUID],
         }
     } else {
         ScanFilter::default()
@@ -211,7 +216,7 @@ pub async fn scan_devices_with(opts: ScanOptions) -> Result<Vec<DeviceInfo>> {
         for p in central.peripherals().await? {
             let props = p.properties().await?.unwrap_or_default();
             let name = props.local_name.clone().unwrap_or_default();
-            let advertises_el15 = props.services.contains(&EL15_SERVICE_UUID);
+            let advertises_el15 = props.services.contains(&SERVICE_UUID);
             let name_match = !name.is_empty()
                 && NAME_PREFIXES
                     .iter()
@@ -302,7 +307,7 @@ impl Device {
                 || props.contains(btleplug::api::CharPropFlags::WRITE_WITHOUT_RESPONSE);
             let notifies = props.contains(btleplug::api::CharPropFlags::NOTIFY)
                 || props.contains(btleplug::api::CharPropFlags::INDICATE);
-            let on_el15_service = c.service_uuid == EL15_SERVICE_UUID;
+            let on_el15_service = c.service_uuid == SERVICE_UUID;
 
             if writable {
                 if on_el15_service && write_char.is_none() {
@@ -343,10 +348,13 @@ impl Device {
             while let Some(notif) = stream.next().await {
                 let data = notif.value;
                 let _ = tx.send(DeviceEvent::RawNotification(data.clone())).await;
-                if data.len() >= 4 && data[..4] == HEADER {
-                    let status = parse_status_packet(&data);
-                    if status.valid {
-                        let _ = tx.send(DeviceEvent::Status(status)).await;
+                if data.starts_with(&STATUS_HEADER) {
+                    match parse_status_packet(&data) {
+                        Ok(status) => {
+                            let _ = tx.send(DeviceEvent::Status(status)).await;
+                        }
+                        // Corrupted or truncated: never report it as a measurement.
+                        Err(e) => debug!("dropped status notification: {e}"),
                     }
                 } else if let Some(ver) = parse_firmware_version(&data) {
                     let _ = tx.send(DeviceEvent::FirmwareVersion(ver)).await;
@@ -430,16 +438,5 @@ impl Device {
         let _ = self.peripheral.unsubscribe(&self.notify_char).await;
         self.peripheral.disconnect().await?;
         Ok(())
-    }
-
-    pub async fn watch_central_events() -> Result<impl futures::Stream<Item = CentralEvent>> {
-        let manager = Manager::new().await?;
-        let adapter = manager
-            .adapters()
-            .await?
-            .into_iter()
-            .next()
-            .ok_or(Error::NoAdapter)?;
-        Ok(adapter.events().await?)
     }
 }

@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 
 use alientek_el15::{
     build_mode_cmd, build_set_cap_current_cmd, build_set_setpoint_cmd, scan_devices,
-    scan_for_device, Device, DeviceEvent, DeviceInfo, EL15Status, Mode, CAP_CURRENT_MAX_A,
+    scan_for_device, Device, DeviceEvent, DeviceInfo, Mode, Status, CAP_CURRENT_MAX_A,
     CMD_GET_CAP_CURRENT, CMD_LOAD_OFF, CMD_LOAD_ON, INTER_COMMAND_GAP,
 };
 
@@ -217,7 +217,7 @@ pub struct AppState {
     selected_device: Option<DeviceChoice>,
     device: Option<Arc<Device>>,
     connecting: bool,
-    last_status: Option<EL15Status>,
+    last_status: Option<Status>,
     samples: VecDeque<Sample>,
 
     setpoint_input: String,
@@ -742,9 +742,10 @@ impl AppState {
                         self.trim_samples(now);
                         // Reuse the previous sample's mode allocation — the name
                         // only changes on an actual mode switch.
+                        let mode_name = st.mode().map_or("?", Mode::as_str);
                         let mode = match self.samples.back() {
-                            Some(prev) if *prev.mode == *st.mode_name => Arc::clone(&prev.mode),
-                            _ => Arc::from(st.mode_name.as_str()),
+                            Some(prev) if *prev.mode == *mode_name => Arc::clone(&prev.mode),
+                            _ => Arc::from(mode_name),
                         };
                         self.samples.push_back(Sample {
                             when: now,
@@ -779,11 +780,11 @@ impl AppState {
                             self.settings.last_mode = device_mode;
                         }
                     }
-                    self.last_command_ok = st.warning.is_empty();
+                    self.last_command_ok = st.warning.is_none();
                     self.last_status = Some(st);
                 }
                 DeviceEvent::FirmwareVersion(ver) => {
-                    self.firmware_version = Some(ver);
+                    self.firmware_version = Some(ver.to_string());
                 }
                 DeviceEvent::CapCurrent(amps) => {
                     debug!("device CAP discharge current: {amps} A");
@@ -1467,12 +1468,16 @@ impl AppState {
                 Space::new().width(12.0),
                 text(format!("{}: {}/5", t!("label.fan"), st.fan_speed)).size(13),
                 Space::new().width(12.0),
-                text(format!("{}: {}", t!("label.mode"), if st.mode_name.is_empty() { "---".into() } else { st.mode_name.clone() })).size(13),
+                text(format!("{}: {}", t!("label.mode"), st.mode().map_or("---", Mode::as_str))).size(13),
                 Space::new().width(12.0),
                 text(format!("{}: {}", t!("label.dev_versions"), self.firmware_version.as_deref().unwrap_or("---"))).size(13),
                 Space::new().width(Length::Fill),
-                indicator(if st.warning.is_empty() && self.last_command_ok { "OK" } else if !st.warning.is_empty() { st.warning.as_str() } else { "ERR" },
-                    if st.warning.is_empty() && self.last_command_ok { COLOR_LOAD_ON } else { COLOR_CURRENT }),
+                indicator(&match st.warning {
+                        Some(w) => w.to_string(),
+                        None if self.last_command_ok => "OK".to_string(),
+                        None => "ERR".to_string(),
+                    },
+                    if st.warning.is_none() && self.last_command_ok { COLOR_LOAD_ON } else { COLOR_CURRENT }),
                 Space::new().width(12.0),
                 badge(
                     &load_label,
@@ -1824,7 +1829,7 @@ impl AppState {
         .into()
     }
 
-    fn right_panel(&self, st: &EL15Status) -> Element<'_, Message> {
+    fn right_panel(&self, st: &Status) -> Element<'_, Message> {
         let runtime_secs = st.runtime_s;
         let runtime = format!(
             "{:02}:{:02}:{:02}",
@@ -1853,7 +1858,7 @@ impl AppState {
             }
             ModeKind::DCR => {
                 let temp_card = info_card(&lbl_temperature, &format!("{:.2} °C", st.temperature));
-                let dcr_card = info_card(&lbl_resistance, &format!("{:.1} mΩ", st.dcr_mohm));
+                let dcr_card = info_card(&lbl_resistance, &format!("{:.1} mΩ", st.dcr_ohm));
                 column![runtime_card, temp_card, dcr_card].spacing(6).into()
             }
         }
@@ -3297,10 +3302,8 @@ mod tests {
         state.pending_mode_switch = Some((ModeKind::CP, std::time::Instant::now()));
 
         // Incoming status packet still reports CC — should be ignored.
-        let mut st = EL15Status {
-            valid: true,
+        let mut st = Status {
             mode_byte: 0x01, // CC
-            mode_name: "CC".to_string(),
             ..Default::default()
         };
         let _ = state.update(Message::DeviceEvent(DeviceEvent::Status(st.clone())));
@@ -3310,7 +3313,6 @@ mod tests {
 
         // Now device confirms CP mode.
         st.mode_byte = 0x19; // CP
-        st.mode_name = "CP".to_string();
         let _ = state.update(Message::DeviceEvent(DeviceEvent::Status(st)));
         // Pending should be cleared.
         assert!(state.pending_mode_switch.is_none());

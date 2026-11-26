@@ -146,7 +146,7 @@ async fn handle(state: &SharedState, head: &str, args: &str, is_query: bool) -> 
 
         // -------- DCR mode measurement --------
         "MEAS:DCR" | "MEASURE:DCR" if is_query => {
-            Some(format!("{:.6}", state.snapshot().await.status.dcr_mohm))
+            Some(format!("{:.6}", state.snapshot().await.status.dcr_ohm))
         }
 
         _ if is_query => Some("-113,\"Undefined header\"".to_string()),

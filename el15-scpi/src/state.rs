@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use alientek_el15::{Device, EL15Status, Mode};
+use alientek_el15::{Device, Status, Mode};
 
 /// Shared device + last-known-status used by every SCPI session.
 #[derive(Clone)]
@@ -11,7 +11,7 @@ pub struct SharedState {
 
 struct Inner {
     pub device: Option<Arc<Device>>,
-    pub status: EL15Status,
+    pub status: Status,
     pub setpoint_cc: f32,
     pub setpoint_cv: f32,
     pub setpoint_cr: f32,
@@ -24,7 +24,7 @@ impl Default for SharedState {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 device: None,
-                status: EL15Status::default(),
+                status: Status::default(),
                 setpoint_cc: 12.0,
                 setpoint_cv: 5.0,
                 setpoint_cr: 0.5,
@@ -40,7 +40,7 @@ impl SharedState {
         self.inner.lock().await.device = dev;
     }
 
-    pub async fn update_status(&self, status: EL15Status) {
+    pub async fn update_status(&self, status: Status) {
         let mut g = self.inner.lock().await;
         if let Some(m) = status.mode() {
             g.last_mode = m;
@@ -79,7 +79,7 @@ impl SharedState {
 
 pub struct StateSnapshot {
     pub device: Option<Arc<Device>>,
-    pub status: EL15Status,
+    pub status: Status,
     pub setpoint_cc: f32,
     pub setpoint_cv: f32,
     pub setpoint_cr: f32,

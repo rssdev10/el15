@@ -47,6 +47,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "alientek-el15"
+version = "0.1.0"
+dependencies = [
+ "btleplug",
+ "futures",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1209,12 +1223,12 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 name = "el15-app"
 version = "0.1.4"
 dependencies = [
+ "alientek-el15",
  "anyhow",
  "chrono",
  "clap",
  "confy",
  "csv",
- "el15-bt",
  "el15-scpi",
  "embed-resource",
  "futures",
@@ -1239,25 +1253,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "el15-bt"
-version = "0.1.4"
-dependencies = [
- "btleplug",
- "futures",
- "serde",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "el15-scpi"
 version = "0.1.4"
 dependencies = [
+ "alientek-el15",
  "chrono",
- "el15-bt",
  "futures",
  "thiserror 1.0.69",
  "tokio",

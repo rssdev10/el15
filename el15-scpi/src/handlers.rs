@@ -1,7 +1,7 @@
 //! SCPI command dispatcher. Maps a subset of the RIGOL DL3000 command tree
 //! onto EL15 BT operations.
 
-use el15_bt::{build_mode_cmd, build_set_setpoint_cmd, Mode, CMD_LOAD_OFF, CMD_LOAD_ON};
+use alientek_el15::{build_mode_cmd, build_set_setpoint_cmd, Mode, CMD_LOAD_OFF, CMD_LOAD_ON};
 
 use crate::state::SharedState;
 
@@ -146,12 +146,17 @@ async fn handle(state: &SharedState, head: &str, args: &str, is_query: bool) -> 
 
         // -------- DCR mode measurement --------
         "MEAS:DCR" | "MEASURE:DCR" if is_query => {
-            Some(format!("{:.6}", state.snapshot().await.status.dcr_mohm))
+            Some(format!("{:.6}", dcr_ohms(&state.snapshot().await.status)))
         }
 
         _ if is_query => Some("-113,\"Undefined header\"".to_string()),
         _ => None,
     }
+}
+
+/// The last DCR result in Ohms, the SCPI base unit; the device reports milliohms.
+fn dcr_ohms(status: &alientek_el15::Status) -> f32 {
+    status.dcr_mohm / 1000.0
 }
 
 async fn handle_setpoint(state: &SharedState, mode: Mode, args: &str, is_query: bool) -> Option<String> {
@@ -168,6 +173,14 @@ async fn handle_setpoint(state: &SharedState, mode: Mode, args: &str, is_query: 
     }
 
     let value: f32 = args.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    // NaN, infinity or a negative value never reaches the device (or the stored state).
+    let frame = match build_set_setpoint_cmd(value) {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::warn!("SCPI setpoint rejected: {e}");
+            return None;
+        }
+    };
     state.set_setpoint(mode, value).await;
     if let Some(d) = state.snapshot().await.device {
         // Make sure we are in the right mode first, then send setpoint.
@@ -175,7 +188,7 @@ async fn handle_setpoint(state: &SharedState, mode: Mode, args: &str, is_query: 
             let _ = d.send(&build_mode_cmd(mode)).await;
             state.set_mode(mode).await;
         }
-        let _ = d.send(&build_set_setpoint_cmd(value)).await;
+        let _ = d.send(&frame).await;
     }
     None
 }
@@ -213,5 +226,17 @@ fn scpi_func(mode: Mode) -> &'static str {
         Mode::CAP => "CAP",
         Mode::DCR => "DCR",
         _ => "CURR",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dcr_is_reported_in_ohms() {
+        // 173.15 mΩ, as the device reported for a Li-ion cell.
+        let status = alientek_el15::Status { dcr_mohm: 173.15, ..Default::default() };
+        assert!((dcr_ohms(&status) - 0.17315).abs() < 1e-6);
     }
 }

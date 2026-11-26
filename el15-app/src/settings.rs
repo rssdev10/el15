@@ -162,30 +162,30 @@ impl Default for DcrSettings {
     }
 }
 
-/// Mirrors `el15_bt::Mode` but is Serde-stable across firmware tweaks.
+/// Mirrors `alientek_el15::Mode` but is Serde-stable across firmware tweaks.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum ModeKind { CC, CV, CR, CP, CAP, DCR }
 
 impl ModeKind {
-    pub fn to_proto(self) -> el15_bt::Mode {
+    pub fn to_proto(self) -> alientek_el15::Mode {
         match self {
-            ModeKind::CC  => el15_bt::Mode::CC,
-            ModeKind::CV  => el15_bt::Mode::CV,
-            ModeKind::CR  => el15_bt::Mode::CR,
-            ModeKind::CP  => el15_bt::Mode::CP,
-            ModeKind::CAP => el15_bt::Mode::CAP,
-            ModeKind::DCR => el15_bt::Mode::DCR,
+            ModeKind::CC  => alientek_el15::Mode::CC,
+            ModeKind::CV  => alientek_el15::Mode::CV,
+            ModeKind::CR  => alientek_el15::Mode::CR,
+            ModeKind::CP  => alientek_el15::Mode::CP,
+            ModeKind::CAP => alientek_el15::Mode::CAP,
+            ModeKind::DCR => alientek_el15::Mode::DCR,
         }
     }
-    pub fn from_proto(m: el15_bt::Mode) -> Option<Self> {
+    pub fn from_proto(m: alientek_el15::Mode) -> Option<Self> {
         Some(match m {
-            el15_bt::Mode::CC  => ModeKind::CC,
-            el15_bt::Mode::CV  => ModeKind::CV,
-            el15_bt::Mode::CR  => ModeKind::CR,
-            el15_bt::Mode::CP  => ModeKind::CP,
-            el15_bt::Mode::CAP => ModeKind::CAP,
-            el15_bt::Mode::DCR => ModeKind::DCR,
+            alientek_el15::Mode::CC  => ModeKind::CC,
+            alientek_el15::Mode::CV  => ModeKind::CV,
+            alientek_el15::Mode::CR  => ModeKind::CR,
+            alientek_el15::Mode::CP  => ModeKind::CP,
+            alientek_el15::Mode::CAP => ModeKind::CAP,
+            alientek_el15::Mode::DCR => ModeKind::DCR,
             _ => return None,
         })
     }

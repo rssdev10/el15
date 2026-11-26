@@ -1,14 +1,12 @@
 # EL15 Bluetooth LE Protocol
 
-This document is a Rust-side mirror of the protocol implementation in
-[`maj113/DM40GUI`](https://github.com/maj113/DM40GUI), specifically:
+The protocol was reverse-engineered from the Bluetooth traffic of ALIENTEK's official
+Android app, **ATK-xTOOL** (HCI captures), and cross-checked against the Python project
+[`maj113/DM40GUI`](https://github.com/maj113/DM40GUI). Commands beyond the app's
+everyday use (e.g. the CAP discharge current) were found and verified on a real device.
 
-- [`el15/protocol_constants.py`](https://github.com/maj113/DM40GUI/blob/master/el15/protocol_constants.py)
-- [`el15/app.py`](https://github.com/maj113/DM40GUI/blob/master/el15/app.py)
-
-The protocol was **extended using reverse-engineered commands**.
-
-The Rust port lives in [el15-bt/src/protocol.rs](../el15-bt/src/protocol.rs).
+The Rust implementation is the [`alientek-el15`](../alientek-el15/README.md) crate:
+[alientek-el15/src/protocol.rs](../alientek-el15/src/protocol.rs).
 
 ## Transport
 
@@ -17,13 +15,13 @@ The Rust port lives in [el15-bt/src/protocol.rs](../el15-bt/src/protocol.rs).
 
       0000fff0-0000-1000-8000-00805f9b34fb
 
-  This is exported as `el15_bt::EL15_SERVICE_UUID`. On Linux/Windows it is
+  This is exported as `alientek_el15::SERVICE_UUID`. On Linux/Windows it is
   used as a BLE scan filter; on macOS CoreBluetooth does not match this UUID
   in passive scan so discovery falls back to device-name prefix matching
   (`EL15`, `ATK-PTEL15`, `ALIENTEK`, etc.).
 
 - The service exposes three characteristics: `FFF1`, `FFF2`, `FFF3`. In
-  practice `FFF1` carries both WRITE + NOTIFY properties, so `el15-bt` uses
+  practice `FFF1` carries both WRITE + NOTIFY properties, so `alientek-el15` uses
   it for bidirectional communication. The DM40GUI Python code takes the same
   approach: discover and use whichever char has WRITE+NOTIFY under the
   `0xFFF0` service.
@@ -43,7 +41,7 @@ The Rust port lives in [el15-bt/src/protocol.rs](../el15-bt/src/protocol.rs).
 The checksum is computed as `(0 - sum_of_preceding_bytes) & 0xFF`. Without
 a valid checksum, the device responds with error code `0x06` in the ACK.
 
-Implementation: `el15_bt::checksum(data: &[u8]) -> u8`.
+Implementation: `alientek_el15::checksum(data: &[u8]) -> u8`.
 
 ## Command pacing (required)
 
@@ -52,8 +50,10 @@ uses it. That has **no flow control**: commands written back-to-back are
 silently dropped, with no error reported to the host.
 
 Leave at least **120 ms** between consecutive commands
-(`el15_bt::INTER_COMMAND_GAP`). Use `Device::send_sequence()` for any burst
-rather than consecutive `send()` calls.
+(`alientek_el15::INTER_COMMAND_GAP`). Since `alientek-el15` 0.1.0, `Device::send`
+enforces this itself: it waits until 120 ms have passed since the previous write
+from any task, so `send()`, `send_sequence()` and `init_handshake()` are all paced.
+A client that writes frames over its own link must do the same.
 
 Measured on HW:2.0 / SW:1.7 — three commands (set mode, set setpoint, set CAP
 current) sent with no gap:
@@ -72,6 +72,26 @@ like a UI that needs several button presses before a command "takes".
 
 The poll timer must also be held off for the duration of a burst, otherwise the
 periodic poll becomes one more back-to-back write (`AppState::pause_ticks_for`).
+With the library pacing every write the poll can no longer be dropped, but it
+still delays the burst by one gap.
+
+Re-measured on HW:2.0 / SW:1.7 (macOS, load off), 6 trials per row:
+
+| Sequence                                     | Gap    | Commands that took effect          | ACKs received |
+| -------------------------------------------- | ------ | ---------------------------------- | ------------- |
+| set mode CAP, set setpoint, set CAP current  | 0 ms   | mode 2/6, CAP current 6/6          | 9/18          |
+|                                              | 30 ms  | mode 5/6, CAP current 6/6          | 12/18         |
+|                                              | 60 ms  | mode 6/6, CAP current 6/6          | 13/18         |
+|                                              | 120 ms | mode 6/6, CAP current 6/6          | 18/18         |
+| same, through the library's paced `send()`   | (≈125 ms) | mode 6/6, CAP current 6/6       | 18/18         |
+| set mode CC↔CV, set CAP current              | 0–120 ms | 6/6 at every gap                 | all           |
+| poll, read CAP current (read-only)           | 0–120 ms | 20/20 at every gap               | —             |
+| init, info (`init_handshake`)                | 0–120 ms | 15/15 at every gap               | —             |
+
+Losses need three writes in a row; read-only queries were never lost. ACKs go
+missing even when every command took effect (60 ms row), so a missing ACK proves
+nothing — confirm with a readback. Over 300 paced polls every status packet
+arrived as one 28-byte notification with a valid checksum.
 
 ## Connection Handshake
 
@@ -86,7 +106,7 @@ the init sequence to wake the device from dormant state:
 Without this handshake the device reports zeros for temperature, setpoint,
 and runtime in status packets.
 
-Implementation: `El15Device::init_handshake()`.
+Implementation: `Device::init_handshake()`.
 
 ## Frames
 
@@ -127,7 +147,7 @@ Observed from HCI log: `DF FF FF 00 02 07 03 17`
 | 5–6    | `07 03`| reserved    | Protocol version or device sub-type                 |
 | 7      | `17`   | sw_byte     | Normal BCD: major = high nibble, minor = low nibble. `0x17` → SW 1.7. Also satisfies checksum (sum of all 8 bytes ≡ 0 mod 256) |
 
-Implementation: `el15_bt::parse_firmware_version(data)` → `Some("HW:2.0 SW:1.7")` for the example above.
+Implementation: `alientek_el15::parse_firmware_version(data)` → `Some(FirmwareVersion { hw_major: 2, hw_minor: 0, sw_major: 1, sw_minor: 7 })` for the example above, displayed as `HW:2.0 SW:1.7`. A packet with a wrong checksum gives `None`.
 
 > **Implementation note:** btleplug uses an internal `broadcast::channel` for notifications. The
 > notification stream receiver must be obtained (via `peripheral.notifications().await`) *before*
@@ -139,7 +159,10 @@ Implementation: `el15_bt::parse_firmware_version(data)` → `Some("HW:2.0 SW:1.7
 
 `DF 07 03 07 <len> <name bytes, null-padded> <checksum>`
 
-Observed: `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
+Observed (official app's capture): `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
+
+The name is whatever was last written with `0x06` (see the command map notes); it is
+not necessarily `EL15`.
 
 | Byte   | Value  | Field       | Notes                                               |
 | ------ | ------ | ----------- | --------------------------------------------------- |
@@ -195,7 +218,7 @@ Observed: `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
 | 11..15 | current    | f32  | Amps (CC/CV/CR/CP)                                                       |
 | 15..19 | runtime    | f32  | Seconds (or DCR I1 current in DCR mode)                                  |
 | 19..23 | varies     | f32  | Temperature (°C) for CC/CV/CR/CP, energy (Wh×1000) for CAP, DCR I2       |
-| 23..27 | varies     | f32  | Setpoint for CC/CV/CR/CP, capacity (Ah×1000) for CAP, DCR resistance (Ω) |
+| 23..27 | varies     | f32  | Setpoint for CC/CV/CR/CP, capacity (Ah×1000) for CAP, DCR resistance (mΩ) |
 | 27     | checksum   | u8   | Sum of all 28 bytes ≡ 0 (mod 256)                                        |
 
 ### Mode-specific field interpretation
@@ -204,7 +227,7 @@ Observed: `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
 | ------- | ---------------- | ----------------- | ------------------ |
 | CC/CV/CR/CP | runtime (s)  | temperature (°C)  | setpoint (mode unit)|
 | CAP     | runtime (s)      | energy (Wh×1000)  | capacity (Ah×1000) |
-| DCR     | I1 current (A)   | I2 current (A)    | resistance (Ω)    |
+| DCR     | I1 current (A)   | I2 current (A)    | resistance (mΩ)   |
 
 ### Warning codes (byte6 high nibble when bit1+bit2 of byte5 are set)
 
@@ -216,12 +239,12 @@ Observed: `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
 
 ## DeviceEvent variants
 
-The `el15-bt` library emits these events from the notification stream:
+The `alientek-el15` library emits these events from the notification stream:
 
 | Variant                      | Trigger                                               |
 | ---------------------------- | ----------------------------------------------------- |
-| `Status(EL15Status)`         | Any 28-byte notification with header `DF 07 03 08`    |
-| `FirmwareVersion(String)`    | Init response with header `DF FF FF`; parsed by `parse_firmware_version` |
+| `Status(Status)`             | 28-byte notification with header `DF 07 03 08` and a valid checksum; `parse_status_packet` returns a `ParseError` otherwise and the packet only appears as `RawNotification` |
+| `FirmwareVersion(FirmwareVersion)` | Init response with header `DF FF FF`; parsed by `parse_firmware_version` |
 | `CapCurrent(f32)`            | CAP discharge-current reply `DF 07 03 0A 04 <f32>`, in Amps |
 | `RawNotification(Vec<u8>)`   | Every notification, unfiltered (for debugging)        |
 | `Disconnected`               | GATT notification stream ends                         |
@@ -269,7 +292,7 @@ means *read*, `len > 0` means *write*.
 | `0x03` | —                       | `len=1` mode     | set mode                         |
 | `0x04` | —                       | `len=4` f32      | set setpoint (CC/CV/CR/CP only)  |
 | `0x05` | code `04`               | `len=4` f32 A    | **set CAP discharge current**    |
-| `0x06` | code `04`               | **only `len=10`** | **unidentified** (see notes)    |
+| `0x06` | code `04`               | **only `len=10`** | **set device name** (see notes) |
 | `0x07` | device name             | —                | info                             |
 | `0x08` | 28-byte status          | —                | poll                             |
 | `0x09` | —                       | `len=1`          | load on / off / lock             |
@@ -294,13 +317,19 @@ Acknowledgement status byte (`DF 07 03 <cmd> 01 <status>`):
   the CAP cutoff these are front-panel settings (manual §3.4.2 "DCR Params").
   They **are** readable: in DCR mode status bytes 15..19 and 19..23 carry I1 and
   I2 in Amps, so the app displays them read-only.
-- **`0x06` takes a 10-byte payload — purpose unknown.** A length sweep found
-  that `0x06` rejects every payload length (code `04`) *except* 10, which is
-  acknowledged with status `00`. Three plausible 10-byte layouts were tried
-  (`f32 A + f32 A + u16`, `f32 mA + f32 mA + u16`, `u16 mA + u16 mA + u16 + pad`)
-  and none changed the reported DCR currents. It remains the best candidate for
-  a DCR- or CAP-parameter block, but it is **not** identified — do not guess at
-  it in code.
+- **`0x06` sets the device name** — the 10-byte field that `0x07` (info) reads
+  back. A length sweep had found that `0x06` rejects every payload length (code
+  `04`) except 10. Three 10-byte layouts tried as DCR parameters (`f32 A + f32 A +
+  u16`, `f32 mA + f32 mA + u16`, `u16 mA + u16 mA + u16 + pad`) changed nothing
+  visible, but afterwards `0x07` returned `0A 14 00 00 00 00 00 00 00 00` — the
+  `u16 20 mA` probe stored as the name. Writing
+  `AF 07 03 06 0A 45 4C 31 35 00 00 00 00 00 00 40` ("EL15", NUL-padded) was
+  acknowledged with `DF 07 03 06 01 00 10`, and `0x07` then returned
+  `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`, byte-identical to the official
+  app's capture. Verified on HW:2.0 / SW:1.7. The name the BLE module **advertises**
+  (`_BLE` on the test unit) did not change on reconnect; whether it follows after a
+  power cycle is not known. The library has no builder for this command: probing it
+  with arbitrary payloads overwrites the name.
 - **CAP cutoff voltage and timer are not available over BLE.** Every opcode was
   probed; none reads or writes them. They are front-panel settings (manual
   §3.4.2 "CAP Params") and the protocol has no equivalent. The app must not
@@ -322,13 +351,19 @@ Acknowledgement status byte (`DF 07 03 <cmd> 01 <status>`):
   Commands go to handle `0x0009`, notifications arrive on `0x0006`. A 28-byte
   status notification fragments as 20+8 on Android, and the 8-byte tail can
   begin with `AF` by coincidence, which looks exactly like a command.
-- **Characteristics:** the official Android app writes to `FFF3` and subscribes
-  to `FFF2`. This client uses `FFF1` for both, which the device also accepts —
-  `Device::connect` picks the first writable/notifying characteristic on the
-  `FFF0` service rather than a fixed UUID. No command has been found that works
-  on one characteristic but not the other.
+- **Characteristics:** the device exposes, under service `FFF0`, `FFF1`
+  (write without response + notify), `FFF2` (read + notify) and `FFF3` (write
+  without response). The official Android app writes to `FFF3` and subscribes to
+  `FFF2`. This client uses `FFF1` for both, which the device also accepts.
+  `Device::connect` prefers `FFF1`, falls back to another characteristic of the
+  `FFF0` service with the needed property, and never uses a characteristic of
+  another service (it fails with `CharacteristicNotFound`). No command has been
+  found that works on one characteristic but not the other.
 - **DCR mode** auto-stops after measurement completes. The `dcr_mohm` field
-  reports resistance in **Ohms** (not milliohms despite the field name).
+  (bytes 23..27, f32) reports resistance in **milliohms**. Measured on a Li-ion
+  cell with I1 = 25 mA and I2 = 1000 mA: 4.1693 V at 0.0248 A and 3.9998 V at
+  1.0013 A give ΔV/ΔI = 0.1736 Ω = 173.6 mΩ; the device reported `173.15`.
+  The field keeps the previous result until a test completes.
 - **Android BLE MTU:** On Android, 28-byte status notifications may arrive
   fragmented as 20+8 byte chunks. On macOS, they arrive as a single 28-byte
   notification.

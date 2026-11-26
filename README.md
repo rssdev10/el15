@@ -35,10 +35,26 @@ Supported features: GUI, CLI, BLE, USB DFU, SCPI
 
 | Crate               | Type | Purpose                                                                               |
 | ------------------- | ---- | ------------------------------------------------------------------------------------- |
-| `el15-bt`           | lib  | BLE protocol implementation, ported from [DM40GUI](https://github.com/maj113/DM40GUI) |
+| `alientek-el15`     | lib  | BLE protocol library, published on crates.io (see [its README](alientek-el15/README.md)) |
 | `el15-scpi`         | lib  | SCPI/LXI raw-socket server emulating a RIGOL DL3000 electronic load                   |
 | `el15-app`          | bin  | Single `el15` binary: iced GUI, headless CLI, USB DFU, and SCPI server                |
 | `scripts/scpi-test` | bin  | Smoke tester for the built-in SCPI server                                             |
+
+## Library
+
+The Bluetooth LE protocol is a separate crate, [`alientek-el15`](alientek-el15/README.md),
+published on crates.io with its own version (tags `alientek-el15-v*`; the app keeps `v*`).
+The app builds it from the local sources. The protocol was reverse-engineered from the
+Bluetooth traffic of ALIENTEK's official Android app, ATK-xTOOL, and cross-checked against
+the Python project [DM40GUI](https://github.com/maj113/DM40GUI).
+
+To use a local checkout of the library in another project, depend on it by path, or keep the
+crates.io dependency and override it:
+
+```toml
+[patch.crates-io]
+alientek-el15 = { path = "../el15/alientek-el15" }
+```
 
 ## Build from source
 

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+# Released as binaries on GitHub, not on crates.io.
+publish = false
 description = "EL15 controller — iced GUI by default, CLI with --no-gui"
 
 [[bin]]
@@ -11,7 +14,7 @@ name = "el15"
 path = "src/main.rs"
 
 [dependencies]
-el15-bt = { path = "../el15-bt" }
+alientek-el15 = { path = "../alientek-el15", version = "0.1" }
 el15-scpi = { path = "../el15-scpi" }
 
 clap.workspace = true

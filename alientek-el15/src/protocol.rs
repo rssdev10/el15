@@ -1,0 +1,761 @@
+//! EL15 packet protocol: command frames, the checksum, and reply parsers.
+//!
+//! All numeric framing is little-endian.
+
+use std::fmt;
+use std::time::Duration;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Wire constants
+// ---------------------------------------------------------------------------
+
+/// Header of the status notification coming *from* the device.
+pub const STATUS_HEADER: [u8; 4] = [0xDF, 0x07, 0x03, 0x08];
+
+/// Length of a status notification, checksum included.
+pub const STATUS_LEN: usize = 28;
+
+/// Pre-computed poll packet (CMD_QUERY prefix + checksum byte 0x3F).
+pub const POLL_PKT: [u8; 6] = [0xAF, 0x07, 0x03, 0x08, 0x00, 0x3F];
+
+/// Init/handshake packet — device responds with firmware version.
+pub const CMD_INIT: [u8; 6] = [0xAF, 0xFF, 0xFF, 0x00, 0x00, 0x53];
+
+/// Device info request — device responds with its stored name.
+pub const CMD_INFO: [u8; 6] = [0xAF, 0x07, 0x03, 0x07, 0x00, 0x40];
+
+/// Switch the load on.
+pub const CMD_LOAD_ON: [u8; 7]  = [0xAF, 0x07, 0x03, 0x09, 0x01, 0x04, 0x39];
+/// Switch the load off.
+pub const CMD_LOAD_OFF: [u8; 7] = [0xAF, 0x07, 0x03, 0x09, 0x01, 0x00, 0x3D];
+/// Lock the front panel.
+pub const CMD_LOCK: [u8; 7]     = [0xAF, 0x07, 0x03, 0x09, 0x01, 0x01, 0x3C];
+
+/// Prefix of a "set mode" command — append the mode byte + checksum.
+const CMD_MODE_PREFIX: [u8; 5] = [0xAF, 0x07, 0x03, 0x03, 0x01];
+
+/// Prefix of a "set setpoint" command — append the f32 LE bytes + checksum.
+///
+/// Applies to CC/CV/CR/CP only. In CAP and DCR the device acknowledges this
+/// command with status `0x00` and then ignores it — use [`CMD_SET_CAP_CURRENT_PREFIX`]
+/// for the CAP discharge current.
+const CMD_SETPOINT_PREFIX: [u8; 5] = [0xAF, 0x07, 0x03, 0x04, 0x04];
+
+/// Prefix of a "set CAP discharge current" command (cmd `0x05`, f32 LE Amps).
+///
+/// Separate opcode from the ordinary setpoint. Verified on HW:2.0 / SW:1.7:
+/// writing here changes the value that [`CMD_GET_CAP_CURRENT`] reads back and
+/// the current shown on the device's capacity-test screen.
+const CMD_SET_CAP_CURRENT_PREFIX: [u8; 5] = [0xAF, 0x07, 0x03, 0x05, 0x04];
+
+/// Read the CAP discharge current — device replies `DF 07 03 0A 04 <f32 LE>`.
+///
+/// The device applies its own quantisation (it stores milliamps), so a value
+/// written as `5.0` reads back as `5.0000010`.
+pub const CMD_GET_CAP_CURRENT: [u8; 6] = [0xAF, 0x07, 0x03, 0x0A, 0x00, 0x3D];
+
+/// Header of the CAP discharge-current response.
+pub const CAP_CURRENT_HEADER: [u8; 5] = [0xDF, 0x07, 0x03, 0x0A, 0x04];
+
+/// Minimum gap between two consecutive command writes.
+///
+/// The write characteristic advertises WRITE_WITHOUT_RESPONSE, so `Device::send`
+/// (feature `ble`) uses it — and that has no flow control: frames written
+/// back-to-back are silently dropped, with no error on this side.
+///
+/// Measured on HW:2.0 / SW:1.7: three commands sent with no gap (set mode CAP,
+/// set setpoint, set CAP current) lost the mode switch 4 times out of 6, and
+/// earlier one reply came back corrupted (`df 01 04 39 …`, containing bytes of
+/// the outgoing frame). The same three 120 ms apart took effect 6 times out of 6.
+/// Read-only queries were never lost. See `docs/BT_PROTOCOL.md`.
+///
+/// This is why a burst of commands used to need several button presses before
+/// one "took". With the `ble` feature, `Device::send` keeps this gap itself.
+pub const INTER_COMMAND_GAP: Duration = Duration::from_millis(120);
+
+/// Compute the checksum byte that makes `sum(packet) % 256 == 0`.
+pub fn checksum(data: &[u8]) -> u8 {
+    let sum: u8 = data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    0u8.wrapping_sub(sum)
+}
+
+/// True when the bytes, checksum included, add up to 0 modulo 256.
+fn checksum_ok(data: &[u8]) -> bool {
+    data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b)) == 0
+}
+
+// ---------------------------------------------------------------------------
+// Modes
+// ---------------------------------------------------------------------------
+
+/// Operating mode, as the byte the device uses on the wire.
+///
+/// CC, CV, CR, CP, CAP and DCR can be selected over BLE; the others are front-panel
+/// screens the device may report (see [`Mode::is_unreachable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[repr(u8)]
+pub enum Mode {
+    CC        = 0x01,
+    CAP       = 0x02,
+    DT        = 0x03,
+    ADV       = 0x04,
+    CV        = 0x09,
+    DCR       = 0x0A,
+    POWER     = 0x0B,
+    AdvScan   = 0x0C,
+    PowerRpt  = 0x0D,
+    CR        = 0x11,
+    CP        = 0x19,
+}
+
+impl Mode {
+    /// The mode for a wire byte, or `None` for a byte no mode uses.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            0x01 => Mode::CC,
+            0x02 => Mode::CAP,
+            0x03 => Mode::DT,
+            0x04 => Mode::ADV,
+            0x09 => Mode::CV,
+            0x0A => Mode::DCR,
+            0x0B => Mode::POWER,
+            0x0C => Mode::AdvScan,
+            0x0D => Mode::PowerRpt,
+            0x11 => Mode::CR,
+            0x19 => Mode::CP,
+            _ => return None,
+        })
+    }
+
+    /// Short label, as on the device screen (`"CC"`, `"CAP"`, `"POW [DT]"`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::CC => "CC",
+            Mode::CAP => "CAP",
+            Mode::DT => "POW [DT]",
+            Mode::ADV => "ADV [L]",
+            Mode::CV => "CV",
+            Mode::DCR => "DCR",
+            Mode::POWER => "POW [A]",
+            Mode::AdvScan => "ADV [S]",
+            Mode::PowerRpt => "POW [RPT]",
+            Mode::CR => "CR",
+            Mode::CP => "CP",
+        }
+    }
+
+    /// `(unit, decimal_places, label)` of the mode's setpoint.
+    pub fn setpoint_info(self) -> (&'static str, u8, &'static str) {
+        match self {
+            Mode::CC | Mode::CAP | Mode::DCR => ("A", 3, "Current"),
+            Mode::CV  => ("V", 3, "Voltage"),
+            Mode::CR  => ("Ω", 1, "Resistance"),
+            Mode::CP  => ("W", 2, "Power"),
+            _ => ("", 3, ""),
+        }
+    }
+
+    /// CAP and DCR: the battery-capacity and internal-resistance tests.
+    pub fn is_advanced(self) -> bool {
+        matches!(self, Mode::CAP | Mode::DCR)
+    }
+
+    /// Front-panel screens that cannot be selected over BLE.
+    pub fn is_unreachable(self) -> bool {
+        matches!(
+            self,
+            Mode::ADV | Mode::POWER | Mode::DT | Mode::AdvScan | Mode::PowerRpt
+        )
+    }
+}
+
+impl fmt::Display for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status packet
+// ---------------------------------------------------------------------------
+
+const STATUS_LOAD_BIT: u8 = 0x02;
+const STATUS_LOCK_BIT: u8 = 0x04;
+const MODE_MASK: u8       = 0x1F;
+const B5_WARN_FLAG: u8    = 0x06; // bits 1+2 simultaneously => protection
+/// Highest value of [`Status::fan_speed`].
+pub const FAN_SPEED_MAX: u8 = 5;
+
+/// Protection warning reported in a status packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum Warning {
+    /// Reverse polarity on the input (code `0x6`).
+    Reverse,
+    /// Under-voltage protection (code `0x9`).
+    Undervoltage,
+    /// Another protection trip, with its 4-bit code.
+    Protection(u8),
+}
+
+impl Warning {
+    fn from_code(code: u8) -> Self {
+        match code {
+            0x6 => Warning::Reverse,
+            0x9 => Warning::Undervoltage,
+            other => Warning::Protection(other),
+        }
+    }
+}
+
+impl fmt::Display for Warning {
+    /// The device's abbreviation: `REV`, `UVP` or `PROT <code>`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Warning::Reverse => f.write_str("REV"),
+            Warning::Undervoltage => f.write_str("UVP"),
+            Warning::Protection(code) => write!(f, "PROT {code:X}"),
+        }
+    }
+}
+
+/// One status notification, decoded.
+///
+/// Which fields carry data depends on the mode: [`setpoint`](Self::setpoint) and
+/// [`temperature`](Self::temperature) in CC/CV/CR/CP, [`capacity_ah`](Self::capacity_ah)
+/// and [`energy_wh`](Self::energy_wh) in CAP, the `dcr_*` fields in DCR. The others are 0.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Status {
+    /// Input voltage, V.
+    pub voltage: f32,
+    /// Load current, A.
+    pub current: f32,
+    /// `voltage * current`, W.
+    pub power: f32,
+    /// Time the load has been on, s (0 in DCR).
+    pub runtime_s: u32,
+    /// Heat-sink temperature, °C (CC/CV/CR/CP).
+    pub temperature: f32,
+    /// Setpoint of the current mode, in its unit (see [`Mode::setpoint_info`]).
+    pub setpoint: f32,
+
+    /// Energy discharged in CAP mode, Wh.
+    pub energy_wh: f32,
+    /// Capacity discharged in CAP mode, Ah.
+    pub capacity_ah: f32,
+
+    /// Internal resistance measured in DCR mode, **mΩ** (milliohms).
+    pub dcr_mohm: f32,
+    /// First DCR test current, A (set on the front panel).
+    pub dcr_i1: f32,
+    /// Second DCR test current, A (set on the front panel).
+    pub dcr_i2: f32,
+
+    /// Mode byte; [`Status::mode`] decodes it.
+    pub mode_byte: u8,
+
+    /// Fan speed, 0 to [`FAN_SPEED_MAX`].
+    pub fan_speed: u8,
+    /// The load is on.
+    pub load_on: bool,
+    /// The front panel is locked.
+    pub lock_on: bool,
+    /// The device is ready (no protection trip).
+    pub ready: bool,
+
+    /// The packet carries a setpoint (CC/CV/CR/CP).
+    pub setpoint_in_packet: bool,
+    /// Protection warning, if one is active.
+    pub warning: Option<Warning>,
+}
+
+impl Status {
+    /// The decoded mode, or `None` for a mode byte no mode uses.
+    pub fn mode(&self) -> Option<Mode> {
+        Mode::from_byte(self.mode_byte)
+    }
+}
+
+/// Why a notification is not a valid status packet.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ParseError {
+    /// The packet does not have [`STATUS_LEN`] bytes.
+    #[error("status packet has {0} bytes, expected {STATUS_LEN}")]
+    WrongLength(usize),
+    /// The packet does not start with [`STATUS_HEADER`].
+    #[error("not a status packet (header {0:02X?})")]
+    WrongHeader([u8; 4]),
+    /// The bytes do not add up to 0 modulo 256: the packet was corrupted.
+    #[error("status packet checksum mismatch")]
+    Checksum,
+}
+
+fn read_f32_le(buf: &[u8]) -> f32 {
+    f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+}
+fn read_u32_le(buf: &[u8]) -> u32 {
+    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+}
+
+/// Parse a 28-byte status notification.
+///
+/// Fails on a wrong length, a wrong header or a bad checksum; a corrupted packet is never
+/// returned as a measurement.
+pub fn parse_status_packet(data: &[u8]) -> Result<Status, ParseError> {
+    if data.len() != STATUS_LEN {
+        return Err(ParseError::WrongLength(data.len()));
+    }
+    if data[..4] != STATUS_HEADER {
+        return Err(ParseError::WrongHeader([data[0], data[1], data[2], data[3]]));
+    }
+    if !checksum_ok(data) {
+        return Err(ParseError::Checksum);
+    }
+
+    let mut s = Status {
+        voltage: read_f32_le(&data[7..11]),
+        current: read_f32_le(&data[11..15]),
+        ..Default::default()
+    };
+
+    let b5 = data[5];
+    let b6 = data[6];
+
+    let warn_flag = (b5 & B5_WARN_FLAG) == B5_WARN_FLAG;
+    let raw_mode = if warn_flag {
+        b5 & (MODE_MASK & !B5_WARN_FLAG)
+    } else {
+        b5 & MODE_MASK
+    };
+    let mode_byte = if Mode::from_byte(raw_mode).is_some() {
+        raw_mode
+    } else {
+        raw_mode | 0x01
+    };
+
+    s.mode_byte = mode_byte;
+    let mode = Mode::from_byte(mode_byte);
+
+    if warn_flag {
+        s.warning = Some(Warning::from_code(b6 >> 4));
+        s.ready = false;
+    } else {
+        s.ready = (raw_mode & 0x01) != 0
+            || matches!(
+                mode,
+                Some(Mode::CAP | Mode::DCR | Mode::ADV | Mode::POWER | Mode::DT | Mode::AdvScan | Mode::PowerRpt)
+            );
+    }
+
+    s.runtime_s = read_u32_le(&data[15..19]);
+    s.power = s.voltage * s.current;
+    s.setpoint_in_packet = true;
+
+    match mode {
+        Some(Mode::CAP) => {
+            s.energy_wh = read_f32_le(&data[19..23]) * 0.001;
+            s.capacity_ah = read_f32_le(&data[23..27]) * 0.001;
+            s.setpoint_in_packet = false;
+        }
+        Some(Mode::DCR) => {
+            s.dcr_i1 = read_f32_le(&data[15..19]);
+            s.dcr_i2 = read_f32_le(&data[19..23]);
+            s.dcr_mohm = read_f32_le(&data[23..27]);
+            s.runtime_s = 0;
+            // Voltage/current/power from bytes 7–15 reflect the live
+            // measurement during the DCR test.
+            s.setpoint_in_packet = false;
+        }
+        Some(Mode::ADV | Mode::POWER | Mode::DT | Mode::PowerRpt) => {
+            s.runtime_s = 0;
+            s.setpoint_in_packet = false;
+        }
+        _ => {
+            s.temperature = read_f32_le(&data[19..23]);
+            s.setpoint = read_f32_le(&data[23..27]);
+        }
+    }
+
+    s.fan_speed = (b5 >> 6) | ((b6 & 0x01) << 2);
+    s.load_on = (b6 & STATUS_LOAD_BIT) != 0;
+    s.lock_on = (b6 & STATUS_LOCK_BIT) != 0;
+
+    Ok(s)
+}
+
+// ---------------------------------------------------------------------------
+// Command builders
+// ---------------------------------------------------------------------------
+
+/// Build a "set mode" command.
+pub fn build_mode_cmd(mode: Mode) -> Vec<u8> {
+    let mut v = Vec::with_capacity(7);
+    v.extend_from_slice(&CMD_MODE_PREFIX);
+    v.push(mode as u8);
+    v.push(checksum(&v));
+    v
+}
+
+/// A value a command builder refuses to put on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum InvalidValue {
+    /// NaN or infinite.
+    #[error("{0} is not a finite number")]
+    NotFinite(f32),
+    /// Below zero.
+    #[error("{0} is negative")]
+    Negative(f32),
+    /// Above the device's limit for this command.
+    #[error("{value} is above the maximum {max}")]
+    AboveMax { value: f32, max: f32 },
+}
+
+fn check_value(value: f32, max: f32) -> Result<f32, InvalidValue> {
+    if !value.is_finite() {
+        Err(InvalidValue::NotFinite(value))
+    } else if value < 0.0 {
+        Err(InvalidValue::Negative(value))
+    } else if value > max {
+        Err(InvalidValue::AboveMax { value, max })
+    } else {
+        Ok(value)
+    }
+}
+
+fn f32_cmd(prefix: &[u8; 5], value: f32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(10);
+    v.extend_from_slice(prefix);
+    v.extend_from_slice(&value.to_le_bytes());
+    v.push(checksum(&v));
+    v
+}
+
+/// Highest setpoint of any mode: CR's 7500 Ω. The per-mode limits (CC 12 A, CV 60 V,
+/// CR 7500 Ω, CP 150 W) are the caller's to apply; this one only keeps absurd values off
+/// the wire.
+pub const SETPOINT_MAX: f32 = 7500.0;
+
+/// Build a "set setpoint" command (CC/CV/CR/CP), in the mode's unit.
+///
+/// Fails for NaN, infinity, a negative value or one above [`SETPOINT_MAX`].
+pub fn build_set_setpoint_cmd(value: f32) -> Result<Vec<u8>, InvalidValue> {
+    let value = check_value(value, SETPOINT_MAX)?;
+    Ok(f32_cmd(&CMD_SETPOINT_PREFIX, value))
+}
+
+/// Highest CAP discharge current the device accepts (12 A = 12000 mA).
+pub const CAP_CURRENT_MAX_A: f32 = 12.0;
+
+/// Build a "set CAP discharge current" command (`0x05`), value in **Amps**.
+///
+/// Fails for NaN, infinity, a negative value or one above [`CAP_CURRENT_MAX_A`].
+pub fn build_set_cap_current_cmd(amps: f32) -> Result<Vec<u8>, InvalidValue> {
+    let amps = check_value(amps, CAP_CURRENT_MAX_A)?;
+    Ok(f32_cmd(&CMD_SET_CAP_CURRENT_PREFIX, amps))
+}
+
+/// Parse a CAP discharge-current response (`DF 07 03 0A 04 <f32 LE> <csum>`).
+///
+/// Returns the current in Amps, or `None` if this is not that response or its
+/// checksum is wrong.
+pub fn parse_cap_current(data: &[u8]) -> Option<f32> {
+    if data.len() != 10 || data[..5] != CAP_CURRENT_HEADER || !checksum_ok(data) {
+        return None;
+    }
+    Some(f32::from_le_bytes([data[5], data[6], data[7], data[8]]))
+}
+
+/// Hardware and firmware version, from the reply to [`CMD_INIT`].
+///
+/// Displays as `HW:2.0 SW:1.7`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct FirmwareVersion {
+    pub hw_major: u8,
+    pub hw_minor: u8,
+    pub sw_major: u8,
+    pub sw_minor: u8,
+}
+
+impl fmt::Display for FirmwareVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "HW:{}.{} SW:{}.{}",
+            self.hw_major, self.hw_minor, self.sw_major, self.sw_minor
+        )
+    }
+}
+
+/// Parse the firmware version from the Init response notification.
+///
+/// Packet: `DF FF FF <status> <hw_ver> <b1> <b2> <sw_ver>` (8 bytes).
+///
+/// Version encoding:
+/// - `hw_ver` (`data[4]`) — reverse-nibble BCD: major = low nibble, minor = high nibble.
+///   e.g. `0x02` → major=2, minor=0 → "2.0"
+/// - `sw_ver` (`data[7]`) — normal BCD: major = high nibble, minor = low nibble.
+///   e.g. `0x17` → major=1, minor=7 → "1.7"
+///   (This byte also satisfies the packet checksum invariant: sum of all 8 bytes ≡ 0 mod 256.)
+///
+/// Returns `None` if this is not that response or its checksum is wrong.
+pub fn parse_firmware_version(data: &[u8]) -> Option<FirmwareVersion> {
+    if data.len() != 8 || data[..3] != [0xDF, 0xFF, 0xFF] || !checksum_ok(data) {
+        return None;
+    }
+    let hw_byte = data[4];
+    let sw_byte = data[7];
+    Some(FirmwareVersion {
+        hw_major: hw_byte & 0x0F,
+        hw_minor: (hw_byte >> 4) & 0x0F,
+        sw_major: (sw_byte >> 4) & 0x0F,
+        sw_minor: sw_byte & 0x0F,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_packet_checksum() {
+        assert_eq!(POLL_PKT, [0xAF, 0x07, 0x03, 0x08, 0x00, 0x3F]);
+        assert!(checksum_ok(&POLL_PKT));
+    }
+
+    #[test]
+    fn load_commands_checksum() {
+        assert!(checksum_ok(&CMD_LOAD_ON));
+        assert!(checksum_ok(&CMD_LOAD_OFF));
+        assert!(checksum_ok(&CMD_LOCK));
+        assert!(checksum_ok(&CMD_INIT));
+        assert!(checksum_ok(&CMD_INFO));
+    }
+
+    #[test]
+    fn empty_packet_invalid() {
+        assert_eq!(parse_status_packet(&[]), Err(ParseError::WrongLength(0)));
+    }
+
+    #[test]
+    fn build_setpoint_cmd_layout() {
+        let cmd = build_set_setpoint_cmd(2.5).unwrap();
+        assert_eq!(&cmd[..5], &CMD_SETPOINT_PREFIX);
+        assert_eq!(cmd.len(), 10);
+        let f = f32::from_le_bytes([cmd[5], cmd[6], cmd[7], cmd[8]]);
+        assert!((f - 2.5).abs() < 1e-6);
+        assert!(checksum_ok(&cmd));
+    }
+
+    /// Byte-for-byte against the frame accepted by the real device
+    /// (HW:2.0 / SW:1.7): `af 07 03 05 04 00 00 a0 40 5e` set 5.0 A and the
+    /// device acknowledged it with `df 07 03 05 01 00 11`.
+    #[test]
+    fn build_set_cap_current_matches_device_accepted_frame() {
+        assert_eq!(
+            build_set_cap_current_cmd(5.0).unwrap(),
+            vec![0xAF, 0x07, 0x03, 0x05, 0x04, 0x00, 0x00, 0xA0, 0x40, 0x5E]
+        );
+        assert_eq!(
+            build_set_cap_current_cmd(3.3).unwrap(),
+            vec![0xAF, 0x07, 0x03, 0x05, 0x04, 0x33, 0x33, 0x53, 0x40, 0x45]
+        );
+    }
+
+    #[test]
+    fn cap_current_outside_device_range_is_rejected() {
+        assert_eq!(
+            build_set_cap_current_cmd(99.0),
+            Err(InvalidValue::AboveMax { value: 99.0, max: CAP_CURRENT_MAX_A })
+        );
+        assert_eq!(build_set_cap_current_cmd(-1.0), Err(InvalidValue::Negative(-1.0)));
+        assert!(matches!(build_set_cap_current_cmd(f32::NAN), Err(InvalidValue::NotFinite(_))));
+        // The limits themselves are accepted.
+        let hi = build_set_cap_current_cmd(CAP_CURRENT_MAX_A).unwrap();
+        assert_eq!(f32::from_le_bytes([hi[5], hi[6], hi[7], hi[8]]), CAP_CURRENT_MAX_A);
+        assert!(checksum_ok(&hi));
+        assert!(build_set_cap_current_cmd(0.0).is_ok());
+    }
+
+    #[test]
+    fn setpoint_rejects_values_that_are_not_numbers() {
+        assert!(matches!(build_set_setpoint_cmd(f32::NAN), Err(InvalidValue::NotFinite(_))));
+        assert_eq!(
+            build_set_setpoint_cmd(f32::INFINITY),
+            Err(InvalidValue::NotFinite(f32::INFINITY))
+        );
+        assert_eq!(build_set_setpoint_cmd(-0.5), Err(InvalidValue::Negative(-0.5)));
+        assert!(build_set_setpoint_cmd(SETPOINT_MAX + 1.0).is_err());
+        assert!(build_set_setpoint_cmd(SETPOINT_MAX).is_ok());
+        assert!(build_set_setpoint_cmd(0.0).is_ok());
+    }
+
+    #[test]
+    fn cap_current_read_command_checksum() {
+        assert_eq!(CMD_GET_CAP_CURRENT, [0xAF, 0x07, 0x03, 0x0A, 0x00, 0x3D]);
+        assert!(checksum_ok(&CMD_GET_CAP_CURRENT));
+    }
+
+    /// Real response captured from the device with its current set to 5000 mA.
+    /// Note the device quantises to milliamps, so 5.0 comes back as 5.0000010 —
+    /// readback must not be compared for exact equality.
+    #[test]
+    fn parse_cap_current_from_device_response() {
+        let resp = [0xDF, 0x07, 0x03, 0x0A, 0x04, 0x02, 0x00, 0xA0, 0x40, 0x27];
+        let amps = parse_cap_current(&resp).expect("should parse");
+        assert!((amps - 5.0).abs() < 1e-4, "got {amps}");
+    }
+
+    #[test]
+    fn parse_cap_current_rejects_other_packets() {
+        // Status packet header — must not be mistaken for a CAP current reply.
+        assert!(parse_cap_current(&[0xDF, 0x07, 0x03, 0x08, 0x16, 0, 0, 0, 0, 0]).is_none());
+        // Acknowledgement of the set command, not the read reply.
+        assert!(parse_cap_current(&[0xDF, 0x07, 0x03, 0x05, 0x01, 0x00, 0x11]).is_none());
+        assert!(parse_cap_current(&[]).is_none());
+        // Real reply with one corrupted payload byte.
+        assert!(parse_cap_current(&[0xDF, 0x07, 0x03, 0x0A, 0x04, 0x03, 0x00, 0xA0, 0x40, 0x27]).is_none());
+    }
+
+    #[test]
+    fn build_mode_cmd_checksum() {
+        let cmd = build_mode_cmd(Mode::CC);
+        assert_eq!(cmd, vec![0xAF, 0x07, 0x03, 0x03, 0x01, 0x01, 0x42]);
+        assert!(checksum_ok(&cmd));
+        assert!(checksum_ok(&build_mode_cmd(Mode::CV)));
+    }
+
+    #[test]
+    fn build_setpoint_10_matches_hci() {
+        let cmd = build_set_setpoint_cmd(10.0).unwrap();
+        assert_eq!(cmd, vec![0xAF, 0x07, 0x03, 0x04, 0x04, 0x00, 0x00, 0x20, 0x41, 0xDE]);
+    }
+
+    #[test]
+    fn mode_from_byte_round_trip() {
+        for m in [Mode::CC, Mode::CV, Mode::CR, Mode::CP, Mode::CAP, Mode::DCR] {
+            assert_eq!(Mode::from_byte(m as u8), Some(m));
+        }
+    }
+
+    #[test]
+    fn mode_labels() {
+        assert_eq!(Mode::CC.to_string(), "CC");
+        assert_eq!(Mode::DT.as_str(), "POW [DT]");
+        assert_eq!(Mode::from_byte(0x05), None);
+    }
+
+    /// Real CC-mode status from the HCI capture (20+8 byte fragments concatenated).
+    const HCI_CC_STATUS: &str = "df07030816010089acff4000000000000000000e0fb0419a99993e6c";
+
+    #[test]
+    fn parse_status_from_hci_log() {
+        let s = parse_status_packet(&hex_to_bytes(HCI_CC_STATUS)).expect("valid packet");
+        assert_eq!(s.mode_byte, 0x01);
+        assert_eq!(s.mode(), Some(Mode::CC));
+        assert!(!s.load_on);
+        assert!((s.voltage - 7.99).abs() < 0.1);
+        assert!((s.setpoint - 0.3).abs() < 0.01);
+        assert!((s.temperature - 22.0).abs() < 1.0);
+        assert_eq!(s.warning, None);
+    }
+
+    /// DCR result from the real device (HW:2.0 / SW:1.7) on a Li-ion cell, right after
+    /// the test stopped: I1 = 25 mA, I2 = 1000 mA, R = 173.15 mΩ. The voltage drop between
+    /// the two test currents (4.1693 V at 0.0248 A, 3.9998 V at 1.0013 A) gives 173.6 mΩ,
+    /// which is how the field is known to be in milliohms, not Ohms.
+    #[test]
+    fn parse_dcr_status_from_device() {
+        let mut data = hex_to_bytes(
+            "df07030816\
+             0a006571854000000000cdcccc3c0000803fcc252d43\
+             00",
+        );
+        data.truncate(STATUS_LEN - 1);
+        data.push(checksum(&data));
+        let s = parse_status_packet(&data).expect("valid packet");
+        assert_eq!(s.mode(), Some(Mode::DCR));
+        assert!(!s.load_on);
+        assert!((s.voltage - 4.1701).abs() < 1e-3);
+        assert!((s.dcr_i1 - 0.025).abs() < 1e-6);
+        assert!((s.dcr_i2 - 1.0).abs() < 1e-6);
+        assert!((s.dcr_mohm - 173.15).abs() < 0.01, "got {}", s.dcr_mohm);
+        assert_eq!(s.runtime_s, 0);
+        assert_eq!(s.temperature, 0.0, "DCR packets carry no temperature");
+    }
+
+    #[test]
+    fn status_with_bad_checksum_is_rejected() {
+        let mut data = hex_to_bytes(HCI_CC_STATUS);
+        data[8] ^= 0x01; // flip one bit of the voltage
+        assert_eq!(parse_status_packet(&data), Err(ParseError::Checksum));
+    }
+
+    #[test]
+    fn status_with_wrong_header_or_length_is_rejected() {
+        let mut data = hex_to_bytes(HCI_CC_STATUS);
+        data[3] = 0x0A;
+        assert_eq!(
+            parse_status_packet(&data),
+            Err(ParseError::WrongHeader([0xDF, 0x07, 0x03, 0x0A]))
+        );
+        let data = hex_to_bytes(HCI_CC_STATUS);
+        assert_eq!(parse_status_packet(&data[..20]), Err(ParseError::WrongLength(20)));
+    }
+
+    #[test]
+    fn status_warning_is_decoded() {
+        // CC with the protection flag (b5 bits 1+2) and code 0x6 (reverse) in b6.
+        let mut data = hex_to_bytes(HCI_CC_STATUS);
+        data[5] = 0x01 | B5_WARN_FLAG;
+        data[6] = 0x60;
+        data[27] = 0;
+        data[27] = checksum(&data);
+        let s = parse_status_packet(&data).expect("valid packet");
+        assert_eq!(s.mode(), Some(Mode::CC));
+        assert_eq!(s.warning, Some(Warning::Reverse));
+        assert!(!s.ready);
+        assert_eq!(s.warning.unwrap().to_string(), "REV");
+        assert_eq!(Warning::from_code(0x9).to_string(), "UVP");
+        assert_eq!(Warning::from_code(0xB).to_string(), "PROT B");
+    }
+
+    #[test]
+    fn parse_firmware_version_real_device() {
+        // Real init response observed in HCI log: DF FF FF 00 02 07 03 17
+        // HW data[4]=0x02: low nibble=2 (major), high nibble=0 (minor) → HW 2.0
+        // SW data[7]=0x17: high nibble=1 (major), low nibble=7 (minor) → SW 1.7
+        let pkt = [0xDF, 0xFF, 0xFF, 0x00, 0x02, 0x07, 0x03, 0x17];
+        let v = parse_firmware_version(&pkt).expect("should parse");
+        assert_eq!(
+            v,
+            FirmwareVersion { hw_major: 2, hw_minor: 0, sw_major: 1, sw_minor: 7 }
+        );
+        assert_eq!(v.to_string(), "HW:2.0 SW:1.7");
+    }
+
+    #[test]
+    fn parse_firmware_version_rejects_short() {
+        assert_eq!(parse_firmware_version(&[0xDF, 0xFF, 0xFF]), None);
+    }
+
+    #[test]
+    fn parse_firmware_version_rejects_wrong_header_or_checksum() {
+        let status_pkt = [0xDF, 0x07, 0x03, 0x08, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(parse_firmware_version(&status_pkt), None);
+        let corrupted = [0xDF, 0xFF, 0xFF, 0x00, 0x02, 0x07, 0x03, 0x18];
+        assert_eq!(parse_firmware_version(&corrupted), None);
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect()
+    }
+}

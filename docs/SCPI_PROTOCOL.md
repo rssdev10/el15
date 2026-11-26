@@ -31,6 +31,7 @@ the *RIGOL DL3000 Series Programmable DC Electronic Load Programming Manual*
 | `MEAS:CURR?`                      | Q         | Latest status `current`                        |
 | `MEAS:POW?`                       | Q         | Latest `voltage * current`                     |
 | `MEAS:RES?`                       | Q         | `voltage / current`                            |
+| `MEAS:DCR?`                       | Q         | Last DCR result in **Ohms** (device reports mΩ) |
 | `SYST:TEMP?` / `SYST:FAN?`        | Q         | Status temperature / fan speed                 |
 
 Unknown queries return `-113,"Undefined header"` (SCPI standard).

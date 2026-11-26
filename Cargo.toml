@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "el15-bt",
+    "alientek-el15",
     "el15-scpi",
     "el15-app",
     "scripts/scpi-test",

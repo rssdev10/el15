@@ -60,7 +60,10 @@ Right side — three stacked info cells (mode-dependent):
 |------|--------|--------|--------|
 | CC/CV/CR/CP | Run Time | Temp (°C) | **Editable setpoint** |
 | CAP | Run Time | Capacity (Ah) | Energy (Wh) |
-│ DCR | Run Time | Temp (°C) | Resistance (mΩ) |
+| DCR | Run Time | Temp (°C), always "---" | Resistance (mΩ) |
+
+DCR status packets carry the two test currents where other modes carry the temperature, so
+there is no temperature reading in DCR; the card shows "---" rather than a false 0.00 °C.
 
 ### 3. Mode/Output Row
 - Mode buttons: CC, CV, CR, CP, (spacer), CAP, DCR

@@ -15,42 +15,28 @@
 use std::time::Duration;
 
 use btleplug::api::{
-    Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType,
+    Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+    ScanFilter, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
 use uuid::{uuid, Uuid};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    parse_cap_current, parse_status_packet, parse_firmware_version, EL15Status, HEADER, POLL_PKT,
-    CMD_INIT, CMD_INFO, CMD_GET_CAP_CURRENT,
+    parse_cap_current, parse_status_packet, parse_firmware_version, FirmwareVersion, Status,
+    STATUS_HEADER, POLL_PKT, CMD_INIT, CMD_INFO, CMD_GET_CAP_CURRENT, INTER_COMMAND_GAP,
 };
 
 const SCAN_DURATION: Duration = Duration::from_secs(5);
 
 /// GATT service UUID exposed by ALIENTEK EL15 (short UUID 0xFFF0).
 /// The writable and notify characteristics live under this service.
-pub const EL15_SERVICE_UUID: Uuid = uuid!("0000fff0-0000-1000-8000-00805f9b34fb");
-
-/// Minimum gap between two consecutive command writes.
-///
-/// The write characteristic advertises WRITE_WITHOUT_RESPONSE, so [`Device::send`]
-/// uses it — and that has no flow control: frames written back-to-back are
-/// silently dropped, with no error on this side.
-///
-/// Measured on HW:2.0 / SW:1.7. Three commands sent with no gap (set mode, set
-/// setpoint, set CAP current) landed **none** of the trailing two — the CAP
-/// current read back unchanged three times running, and one reply came back
-/// corrupted (`df 01 04 39 …`, containing bytes of the outgoing frame). The
-/// same three spaced 120 ms apart took effect 3 times out of 3.
-///
-/// This is why a burst of commands used to need several button presses before
-/// one "took".
-pub const INTER_COMMAND_GAP: Duration = Duration::from_millis(120);
+pub const SERVICE_UUID: Uuid = uuid!("0000fff0-0000-1000-8000-00805f9b34fb");
 
 /// Friendly name prefixes used as a fallback when advertisement data does not
 /// carry the service UUID list (some BT stacks strip 128-bit UUIDs from the
@@ -86,16 +72,21 @@ fn short_id(id: &str) -> String {
     suffix.chars().rev().collect::<String>().to_uppercase()
 }
 
+/// What the notification pump of a connected [`Device`] reports.
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
-    Status(EL15Status),
-    FirmwareVersion(String),
+    /// A valid status packet (checked length, header and checksum).
+    Status(Status),
+    /// The reply to the init handshake.
+    FirmwareVersion(FirmwareVersion),
     /// CAP discharge current in Amps, from a `DF 07 03 0A` response.
     ///
     /// Only emitted in reply to [`Device::request_cap_current`]; the device
     /// never reports this value in the periodic status packet.
     CapCurrent(f32),
+    /// Every notification, unfiltered, including those that failed to parse.
     RawNotification(Vec<u8>),
+    /// The notification stream ended.
     Disconnected,
 }
 
@@ -139,7 +130,7 @@ pub async fn scan_for_device(target_id: &str, timeout: Duration) -> Result<Optio
     info!("quick-scan for known device {}", &target_id[..target_id.len().min(12)]);
 
     let filter = if !cfg!(target_os = "macos") {
-        ScanFilter { services: vec![EL15_SERVICE_UUID] }
+        ScanFilter { services: vec![SERVICE_UUID] }
     } else {
         ScanFilter::default()
     };
@@ -198,7 +189,7 @@ pub async fn scan_devices_with(opts: ScanOptions) -> Result<Vec<DeviceInfo>> {
         // the service UUID in their GATT table (not in advertisement data).
         // So we always scan unfiltered on Apple platforms and post-filter.
         ScanFilter {
-            services: vec![EL15_SERVICE_UUID],
+            services: vec![SERVICE_UUID],
         }
     } else {
         ScanFilter::default()
@@ -211,7 +202,7 @@ pub async fn scan_devices_with(opts: ScanOptions) -> Result<Vec<DeviceInfo>> {
         for p in central.peripherals().await? {
             let props = p.properties().await?.unwrap_or_default();
             let name = props.local_name.clone().unwrap_or_default();
-            let advertises_el15 = props.services.contains(&EL15_SERVICE_UUID);
+            let advertises_el15 = props.services.contains(&SERVICE_UUID);
             let name_match = !name.is_empty()
                 && NAME_PREFIXES
                     .iter()
@@ -255,11 +246,52 @@ pub async fn scan_devices_with(opts: ScanOptions) -> Result<Vec<DeviceInfo>> {
     Ok(out)
 }
 
+/// The characteristic the device both accepts commands on and notifies from (`FFF1`).
+const DATA_CHAR_UUID: Uuid = uuid!("0000fff1-0000-1000-8000-00805f9b34fb");
+
+fn is_writable(c: &Characteristic) -> bool {
+    c.properties.contains(CharPropFlags::WRITE)
+        || c.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
+}
+
+fn is_notifying(c: &Characteristic) -> bool {
+    c.properties.contains(CharPropFlags::NOTIFY) || c.properties.contains(CharPropFlags::INDICATE)
+}
+
+/// Pick the write and notify characteristics, only from the EL15 service.
+///
+/// The EL15 (HW:2.0 / SW:1.7) exposes `FFF1` (write without response + notify),
+/// `FFF2` (read + notify) and `FFF3` (write without response) under `FFF0`. `FFF1`
+/// carries both directions and is preferred; another characteristic of the service is
+/// used only if `FFF1` lacks the property. A characteristic outside the service is never
+/// used: on a peripheral that is not an EL15 that would mean writing EL15 commands to an
+/// unrelated characteristic.
+fn select_characteristics(
+    chars: &std::collections::BTreeSet<Characteristic>,
+) -> Result<(Characteristic, Characteristic)> {
+    let pick = |wanted: fn(&Characteristic) -> bool| {
+        let on_service = || chars.iter().filter(|c| c.service_uuid == SERVICE_UUID && wanted(c));
+        on_service()
+            .find(|c| c.uuid == DATA_CHAR_UUID)
+            .or_else(|| on_service().next())
+            .cloned()
+    };
+    let write = pick(is_writable).ok_or(Error::CharacteristicNotFound("writable on service FFF0"))?;
+    let notify = pick(is_notifying).ok_or(Error::CharacteristicNotFound("notify on service FFF0"))?;
+    Ok((write, notify))
+}
+
 /// Connected EL15 handle.
+///
+/// Every write goes through [`Device::send`], which keeps [`INTER_COMMAND_GAP`] between
+/// consecutive writes, so callers on several tasks can share one `Device` (e.g. in an
+/// `Arc`) without their commands being dropped.
 pub struct Device {
     peripheral: Peripheral,
-    write_char: btleplug::api::Characteristic,
-    notify_char: btleplug::api::Characteristic,
+    write_char: Characteristic,
+    notify_char: Characteristic,
+    /// When the last write finished; held across a write so writes never overlap.
+    last_write: Mutex<Option<Instant>>,
 }
 
 impl Device {
@@ -291,43 +323,11 @@ impl Device {
     async fn build_device(p: Peripheral) -> Result<(Self, ReceiverStream<DeviceEvent>)> {
         p.discover_services().await?;
 
-        let mut write_char = None;
-        let mut notify_char = None;
-        let mut write_char_fallback = None;
-        let mut notify_char_fallback = None;
-
-        for c in p.characteristics() {
-            let props = c.properties;
-            let writable = props.contains(btleplug::api::CharPropFlags::WRITE)
-                || props.contains(btleplug::api::CharPropFlags::WRITE_WITHOUT_RESPONSE);
-            let notifies = props.contains(btleplug::api::CharPropFlags::NOTIFY)
-                || props.contains(btleplug::api::CharPropFlags::INDICATE);
-            let on_el15_service = c.service_uuid == EL15_SERVICE_UUID;
-
-            if writable {
-                if on_el15_service && write_char.is_none() {
-                    debug!("write characteristic on EL15 service: {}", c.uuid);
-                    write_char = Some(c.clone());
-                } else if write_char_fallback.is_none() {
-                    write_char_fallback = Some(c.clone());
-                }
-            }
-            if notifies {
-                if on_el15_service && notify_char.is_none() {
-                    debug!("notify characteristic on EL15 service: {}", c.uuid);
-                    notify_char = Some(c.clone());
-                } else if notify_char_fallback.is_none() {
-                    notify_char_fallback = Some(c.clone());
-                }
-            }
-        }
-
-        let write_char = write_char
-            .or(write_char_fallback)
-            .ok_or(Error::CharacteristicNotFound("writable"))?;
-        let notify_char = notify_char
-            .or(notify_char_fallback)
-            .ok_or(Error::CharacteristicNotFound("notify"))?;
+        let (write_char, notify_char) = select_characteristics(&p.characteristics())?;
+        debug!(
+            "EL15 characteristics: write {}, notify {}",
+            write_char.uuid, notify_char.uuid
+        );
 
         p.subscribe(&notify_char).await?;
 
@@ -343,10 +343,13 @@ impl Device {
             while let Some(notif) = stream.next().await {
                 let data = notif.value;
                 let _ = tx.send(DeviceEvent::RawNotification(data.clone())).await;
-                if data.len() >= 4 && data[..4] == HEADER {
-                    let status = parse_status_packet(&data);
-                    if status.valid {
-                        let _ = tx.send(DeviceEvent::Status(status)).await;
+                if data.starts_with(&STATUS_HEADER) {
+                    match parse_status_packet(&data) {
+                        Ok(status) => {
+                            let _ = tx.send(DeviceEvent::Status(status)).await;
+                        }
+                        // Corrupted or truncated: never report it as a measurement.
+                        Err(e) => debug!("dropped status notification: {e}"),
                     }
                 } else if let Some(ver) = parse_firmware_version(&data) {
                     let _ = tx.send(DeviceEvent::FirmwareVersion(ver)).await;
@@ -362,16 +365,31 @@ impl Device {
                 peripheral: p,
                 write_char,
                 notify_char,
+                last_write: Mutex::new(None),
             },
             ReceiverStream::new(rx),
         ))
     }
 
+    /// Write one command frame.
+    ///
+    /// Waits until [`INTER_COMMAND_GAP`] has passed since the previous write (from any
+    /// task), because the device silently drops frames written closer together.
     pub async fn send(&self, payload: &[u8]) -> Result<()> {
+        let mut last_write = self.last_write.lock().await;
+        if let Some(at) = *last_write {
+            tokio::time::sleep_until(at + INTER_COMMAND_GAP).await;
+        }
+        let result = self.write_now(payload).await;
+        *last_write = Some(Instant::now());
+        result
+    }
+
+    async fn write_now(&self, payload: &[u8]) -> Result<()> {
         let kind = if self
             .write_char
             .properties
-            .contains(btleplug::api::CharPropFlags::WRITE_WITHOUT_RESPONSE)
+            .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
         {
             WriteType::WithoutResponse
         } else {
@@ -383,15 +401,10 @@ impl Device {
         Ok(())
     }
 
-    /// Send several commands in order, pausing [`INTER_COMMAND_GAP`] between them.
-    ///
-    /// Always prefer this over consecutive [`Device::send`] calls: commands
-    /// written back-to-back are silently dropped (see the constant's docs).
+    /// Send several commands in order, [`INTER_COMMAND_GAP`] apart, stopping at the
+    /// first error.
     pub async fn send_sequence(&self, frames: &[Vec<u8>]) -> Result<()> {
-        for (i, frame) in frames.iter().enumerate() {
-            if i > 0 {
-                tokio::time::sleep(INTER_COMMAND_GAP).await;
-            }
+        for frame in frames {
             self.send(frame).await?;
         }
         Ok(())
@@ -412,6 +425,8 @@ impl Device {
 
     /// Send the init handshake and info request to wake up the device's
     /// full status reporting (temperature, setpoint, etc.).
+    ///
+    /// The two frames go out [`INTER_COMMAND_GAP`] apart, like every write.
     pub async fn init_handshake(&self) -> Result<()> {
         self.send(&CMD_INIT).await?;
         self.send(&CMD_INFO).await?;
@@ -431,15 +446,72 @@ impl Device {
         self.peripheral.disconnect().await?;
         Ok(())
     }
+}
 
-    pub async fn watch_central_events() -> Result<impl futures::Stream<Item = CentralEvent>> {
-        let manager = Manager::new().await?;
-        let adapter = manager
-            .adapters()
-            .await?
-            .into_iter()
-            .next()
-            .ok_or(Error::NoAdapter)?;
-        Ok(adapter.events().await?)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn ch(service: u16, uuid: u16, properties: CharPropFlags) -> Characteristic {
+        let full = |short: u16| {
+            Uuid::from_u128(((short as u128) << 96) | 0x0000_0000_0000_1000_8000_0080_5f9b_34fb)
+        };
+        Characteristic {
+            uuid: full(uuid),
+            service_uuid: full(service),
+            properties,
+            descriptors: BTreeSet::new(),
+        }
+    }
+
+    /// The layout the real device (HW:2.0 / SW:1.7) reports.
+    fn el15_layout() -> BTreeSet<Characteristic> {
+        [
+            ch(0xFFF0, 0xFFF1, CharPropFlags::WRITE_WITHOUT_RESPONSE | CharPropFlags::NOTIFY),
+            ch(0xFFF0, 0xFFF2, CharPropFlags::READ | CharPropFlags::NOTIFY),
+            ch(0xFFF0, 0xFFF3, CharPropFlags::WRITE_WITHOUT_RESPONSE),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn uuid_helper_matches_constants() {
+        assert_eq!(ch(0xFFF0, 0xFFF1, CharPropFlags::NOTIFY).service_uuid, SERVICE_UUID);
+        assert_eq!(ch(0xFFF0, 0xFFF1, CharPropFlags::NOTIFY).uuid, DATA_CHAR_UUID);
+    }
+
+    #[test]
+    fn real_device_uses_fff1_both_ways() {
+        let (w, n) = select_characteristics(&el15_layout()).unwrap();
+        assert_eq!(w.uuid, DATA_CHAR_UUID);
+        assert_eq!(n.uuid, DATA_CHAR_UUID);
+    }
+
+    #[test]
+    fn falls_back_within_the_service_only() {
+        // FFF1 without notify: notify comes from FFF2, still on FFF0.
+        let mut chars = el15_layout();
+        chars.retain(|c| c.uuid != DATA_CHAR_UUID);
+        chars.insert(ch(0xFFF0, 0xFFF1, CharPropFlags::WRITE_WITHOUT_RESPONSE));
+        let (w, n) = select_characteristics(&chars).unwrap();
+        assert_eq!(w.uuid, DATA_CHAR_UUID);
+        assert_eq!(n.uuid, ch(0xFFF0, 0xFFF2, CharPropFlags::NOTIFY).uuid);
+    }
+
+    #[test]
+    fn never_uses_another_service() {
+        // A peripheral that is not an EL15: writable and notifying, but not on FFF0.
+        let chars: BTreeSet<_> = [
+            ch(0x180A, 0x2A29, CharPropFlags::READ),
+            ch(0xFFE0, 0xFFE1, CharPropFlags::WRITE | CharPropFlags::NOTIFY),
+        ]
+        .into_iter()
+        .collect();
+        assert!(matches!(
+            select_characteristics(&chars),
+            Err(Error::CharacteristicNotFound(_))
+        ));
     }
 }

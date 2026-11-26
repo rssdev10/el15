@@ -48,6 +48,53 @@ jobs:
         with:
           draft: true
 
+  # Every app release carries the current library package, even when the library
+  # did not change.  The library has its own version (tags `alientek-el15-v*`, which
+  # do not match `v*` and so do not trigger this workflow) and is published to
+  # crates.io by hand.
+  package-library:
+    name: package alientek-el15
+    needs: [create-release]
+    if: ${{ !cancelled() && needs.create-release.result != 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Package library crate
+        id: library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --locked -p alientek-el15 --no-verify
+          crate_file=$(find target/package -maxdepth 1 -name 'alientek-el15-*.crate' -print -quit)
+          crate_name=$(basename "$crate_file")
+          mkdir -p dist
+          cp "$crate_file" "dist/$crate_name"
+          shasum -a 256 "dist/$crate_name" | awk '{print $1}' > "dist/$crate_name.sha256"
+          echo "crate_name=$crate_name" >> "$GITHUB_OUTPUT"
+
+      - name: Release library package
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/${{ steps.library.outputs.crate_name }}
+            dist/${{ steps.library.outputs.crate_name }}.sha256
+
+      - name: Upload workflow_dispatch library package
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: alientek-el15
+          path: |
+            dist/${{ steps.library.outputs.crate_name }}
+            dist/${{ steps.library.outputs.crate_name }}.sha256
+          retention-days: 7
+
   build:
     name: build (${{ matrix.platform.label }}-${{ matrix.platform.arch }})
     needs: [create-release]

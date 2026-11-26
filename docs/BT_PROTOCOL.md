@@ -159,7 +159,10 @@ Implementation: `alientek_el15::parse_firmware_version(data)` → `Some(Firmware
 
 `DF 07 03 07 <len> <name bytes, null-padded> <checksum>`
 
-Observed: `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
+Observed (official app's capture): `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
+
+The name is whatever was last written with `0x06` (see the command map notes); it is
+not necessarily `EL15`.
 
 | Byte   | Value  | Field       | Notes                                               |
 | ------ | ------ | ----------- | --------------------------------------------------- |
@@ -289,7 +292,7 @@ means *read*, `len > 0` means *write*.
 | `0x03` | —                       | `len=1` mode     | set mode                         |
 | `0x04` | —                       | `len=4` f32      | set setpoint (CC/CV/CR/CP only)  |
 | `0x05` | code `04`               | `len=4` f32 A    | **set CAP discharge current**    |
-| `0x06` | code `04`               | **only `len=10`** | **unidentified** (see notes)    |
+| `0x06` | code `04`               | **only `len=10`** | **set device name** (see notes) |
 | `0x07` | device name             | —                | info                             |
 | `0x08` | 28-byte status          | —                | poll                             |
 | `0x09` | —                       | `len=1`          | load on / off / lock             |
@@ -314,13 +317,19 @@ Acknowledgement status byte (`DF 07 03 <cmd> 01 <status>`):
   the CAP cutoff these are front-panel settings (manual §3.4.2 "DCR Params").
   They **are** readable: in DCR mode status bytes 15..19 and 19..23 carry I1 and
   I2 in Amps, so the app displays them read-only.
-- **`0x06` takes a 10-byte payload — purpose unknown.** A length sweep found
-  that `0x06` rejects every payload length (code `04`) *except* 10, which is
-  acknowledged with status `00`. Three plausible 10-byte layouts were tried
-  (`f32 A + f32 A + u16`, `f32 mA + f32 mA + u16`, `u16 mA + u16 mA + u16 + pad`)
-  and none changed the reported DCR currents. It remains the best candidate for
-  a DCR- or CAP-parameter block, but it is **not** identified — do not guess at
-  it in code.
+- **`0x06` sets the device name** — the 10-byte field that `0x07` (info) reads
+  back. A length sweep had found that `0x06` rejects every payload length (code
+  `04`) except 10. Three 10-byte layouts tried as DCR parameters (`f32 A + f32 A +
+  u16`, `f32 mA + f32 mA + u16`, `u16 mA + u16 mA + u16 + pad`) changed nothing
+  visible, but afterwards `0x07` returned `0A 14 00 00 00 00 00 00 00 00` — the
+  `u16 20 mA` probe stored as the name. Writing
+  `AF 07 03 06 0A 45 4C 31 35 00 00 00 00 00 00 40` ("EL15", NUL-padded) was
+  acknowledged with `DF 07 03 06 01 00 10`, and `0x07` then returned
+  `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`, byte-identical to the official
+  app's capture. Verified on HW:2.0 / SW:1.7. The name the BLE module **advertises**
+  (`_BLE` on the test unit) did not change on reconnect; whether it follows after a
+  power cycle is not known. The library has no builder for this command: probing it
+  with arbitrary payloads overwrites the name.
 - **CAP cutoff voltage and timer are not available over BLE.** Every opcode was
   probed; none reads or writes them. They are front-panel settings (manual
   §3.4.2 "CAP Params") and the protocol has no equivalent. The app must not

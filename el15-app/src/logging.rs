@@ -11,7 +11,7 @@ pub fn init(verbose: u8, log_file: Option<&Path>, verbose_ble: bool, verbose_gui
     };
     // Fine-grained verbose control
     if verbose_ble {
-        directives.push_str(",el15_bt=debug,btleplug=debug");
+        directives.push_str(",alientek_el15=debug,btleplug=debug");
     }
     if verbose_gui {
         directives.push_str(",el15_app::gui=debug");

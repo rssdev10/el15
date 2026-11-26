@@ -4,10 +4,13 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+# Part of the el15 app, not published on crates.io.
+publish = false
 description = "SCPI/LXI server emulating a RIGOL DL3000 Series electronic load on top of an EL15"
 
 [dependencies]
-el15-bt = { path = "../el15-bt" }
+alientek-el15 = { path = "../alientek-el15", version = "0.1" }
 tokio.workspace = true
 tokio-stream.workspace = true
 futures.workspace = true

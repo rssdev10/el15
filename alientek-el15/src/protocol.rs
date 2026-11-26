@@ -1,6 +1,6 @@
-//! EL15 BT packet protocol — port of `DM40GUI/el15/protocol_constants.py`.
+//! EL15 packet protocol: command frames, the checksum, and reply parsers.
 //!
-//! All numeric framing is little-endian (matches Python `memoryview.cast('f'/'i')`).
+//! All numeric framing is little-endian.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -366,9 +366,9 @@ pub fn parse_cap_current(data: &[u8]) -> Option<f32> {
 /// Packet: `DF FF FF <status> <hw_ver> <b1> <b2> <sw_ver>` (8 bytes).
 ///
 /// Version encoding:
-/// - `hw_ver` (byte[4]) — reverse-nibble BCD: major = low nibble, minor = high nibble.
+/// - `hw_ver` (`data[4]`) — reverse-nibble BCD: major = low nibble, minor = high nibble.
 ///   e.g. `0x02` → major=2, minor=0 → "2.0"
-/// - `sw_ver` (byte[7]) — normal BCD: major = high nibble, minor = low nibble.
+/// - `sw_ver` (`data[7]`) — normal BCD: major = high nibble, minor = low nibble.
 ///   e.g. `0x17` → major=1, minor=7 → "1.7"
 ///   (This byte also satisfies the packet checksum invariant: sum of all 8 bytes ≡ 0 mod 256.)
 ///

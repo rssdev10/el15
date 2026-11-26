@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use el15_bt::{
+use alientek_el15::{
     build_mode_cmd, build_set_setpoint_cmd, scan_devices, Device, DeviceEvent, Mode,
     CMD_LOAD_OFF, CMD_LOAD_ON, CMD_LOCK,
 };
@@ -343,7 +343,7 @@ async fn run_debug_shell(args: &Cli) -> Result<()> {
                 println!("  Device: {}", info.display_label());
                 println!("  Address: {}", info.address);
                 println!("  ID: {}", info.id);
-                println!("  Service UUID: {}", el15_bt::EL15_SERVICE_UUID);
+                println!("  Service UUID: {}", alientek_el15::EL15_SERVICE_UUID);
                 println!("  Write char: {}", dev.write_char_uuid());
                 println!("  Notify char: {}", dev.notify_char_uuid());
             }

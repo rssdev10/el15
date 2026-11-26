@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use el15_bt::{Device, EL15Status, Mode};
+use alientek_el15::{Device, EL15Status, Mode};
 
 /// Shared device + last-known-status used by every SCPI session.
 #[derive(Clone)]

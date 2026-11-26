@@ -1,7 +1,7 @@
 //! SCPI command dispatcher. Maps a subset of the RIGOL DL3000 command tree
 //! onto EL15 BT operations.
 
-use el15_bt::{build_mode_cmd, build_set_setpoint_cmd, Mode, CMD_LOAD_OFF, CMD_LOAD_ON};
+use alientek_el15::{build_mode_cmd, build_set_setpoint_cmd, Mode, CMD_LOAD_OFF, CMD_LOAD_ON};
 
 use crate::state::SharedState;
 

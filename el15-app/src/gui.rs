@@ -29,7 +29,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, info, warn};
 
-use el15_bt::{
+use alientek_el15::{
     build_mode_cmd, build_set_cap_current_cmd, build_set_setpoint_cmd, scan_devices,
     scan_for_device, Device, DeviceEvent, DeviceInfo, EL15Status, Mode, CAP_CURRENT_MAX_A,
     CMD_GET_CAP_CURRENT, CMD_LOAD_OFF, CMD_LOAD_ON, INTER_COMMAND_GAP,

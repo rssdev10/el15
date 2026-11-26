@@ -1,14 +1,12 @@
 # EL15 Bluetooth LE Protocol
 
-This document is a Rust-side mirror of the protocol implementation in
-[`maj113/DM40GUI`](https://github.com/maj113/DM40GUI), specifically:
+The protocol was reverse-engineered from the Bluetooth traffic of ALIENTEK's official
+Android app, **ATK-xTOOL** (HCI captures), and cross-checked against the Python project
+[`maj113/DM40GUI`](https://github.com/maj113/DM40GUI). Commands beyond the app's
+everyday use (e.g. the CAP discharge current) were found and verified on a real device.
 
-- [`el15/protocol_constants.py`](https://github.com/maj113/DM40GUI/blob/master/el15/protocol_constants.py)
-- [`el15/app.py`](https://github.com/maj113/DM40GUI/blob/master/el15/app.py)
-
-The protocol was **extended using reverse-engineered commands**.
-
-The Rust port lives in [el15-bt/src/protocol.rs](../el15-bt/src/protocol.rs).
+The Rust implementation is the [`alientek-el15`](../alientek-el15/README.md) crate:
+[alientek-el15/src/protocol.rs](../alientek-el15/src/protocol.rs).
 
 ## Transport
 
@@ -17,13 +15,13 @@ The Rust port lives in [el15-bt/src/protocol.rs](../el15-bt/src/protocol.rs).
 
       0000fff0-0000-1000-8000-00805f9b34fb
 
-  This is exported as `el15_bt::EL15_SERVICE_UUID`. On Linux/Windows it is
+  This is exported as `alientek_el15::EL15_SERVICE_UUID`. On Linux/Windows it is
   used as a BLE scan filter; on macOS CoreBluetooth does not match this UUID
   in passive scan so discovery falls back to device-name prefix matching
   (`EL15`, `ATK-PTEL15`, `ALIENTEK`, etc.).
 
 - The service exposes three characteristics: `FFF1`, `FFF2`, `FFF3`. In
-  practice `FFF1` carries both WRITE + NOTIFY properties, so `el15-bt` uses
+  practice `FFF1` carries both WRITE + NOTIFY properties, so `alientek-el15` uses
   it for bidirectional communication. The DM40GUI Python code takes the same
   approach: discover and use whichever char has WRITE+NOTIFY under the
   `0xFFF0` service.
@@ -43,7 +41,7 @@ The Rust port lives in [el15-bt/src/protocol.rs](../el15-bt/src/protocol.rs).
 The checksum is computed as `(0 - sum_of_preceding_bytes) & 0xFF`. Without
 a valid checksum, the device responds with error code `0x06` in the ACK.
 
-Implementation: `el15_bt::checksum(data: &[u8]) -> u8`.
+Implementation: `alientek_el15::checksum(data: &[u8]) -> u8`.
 
 ## Command pacing (required)
 
@@ -52,7 +50,7 @@ uses it. That has **no flow control**: commands written back-to-back are
 silently dropped, with no error reported to the host.
 
 Leave at least **120 ms** between consecutive commands
-(`el15_bt::INTER_COMMAND_GAP`). Use `Device::send_sequence()` for any burst
+(`alientek_el15::INTER_COMMAND_GAP`). Use `Device::send_sequence()` for any burst
 rather than consecutive `send()` calls.
 
 Measured on HW:2.0 / SW:1.7 — three commands (set mode, set setpoint, set CAP
@@ -127,7 +125,7 @@ Observed from HCI log: `DF FF FF 00 02 07 03 17`
 | 5–6    | `07 03`| reserved    | Protocol version or device sub-type                 |
 | 7      | `17`   | sw_byte     | Normal BCD: major = high nibble, minor = low nibble. `0x17` → SW 1.7. Also satisfies checksum (sum of all 8 bytes ≡ 0 mod 256) |
 
-Implementation: `el15_bt::parse_firmware_version(data)` → `Some("HW:2.0 SW:1.7")` for the example above.
+Implementation: `alientek_el15::parse_firmware_version(data)` → `Some("HW:2.0 SW:1.7")` for the example above.
 
 > **Implementation note:** btleplug uses an internal `broadcast::channel` for notifications. The
 > notification stream receiver must be obtained (via `peripheral.notifications().await`) *before*
@@ -216,7 +214,7 @@ Observed: `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
 
 ## DeviceEvent variants
 
-The `el15-bt` library emits these events from the notification stream:
+The `alientek-el15` library emits these events from the notification stream:
 
 | Variant                      | Trigger                                               |
 | ---------------------------- | ----------------------------------------------------- |

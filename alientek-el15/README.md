@@ -55,8 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 A complete version is in [examples/status.rs](examples/status.rs).
 
-The device drops commands written back-to-back: keep at least `INTER_COMMAND_GAP` (120 ms)
-between writes, and use `Device::send_sequence` for bursts.
+The device silently drops commands written back-to-back. `Device::send` keeps
+`INTER_COMMAND_GAP` (120 ms) since the previous write, from any task, so a shared `Device`
+is safe to use; if you write frames over your own link (without the `ble` feature), keep the
+same gap yourself.
 
 ## Using local sources
 

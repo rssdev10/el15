@@ -403,13 +403,52 @@ pub fn build_mode_cmd(mode: Mode) -> Vec<u8> {
     v
 }
 
-/// Build a "set setpoint" command (CC/CV/CR/CP), in the mode's unit.
-pub fn build_set_setpoint_cmd(value: f32) -> Vec<u8> {
+/// A value a command builder refuses to put on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum InvalidValue {
+    /// NaN or infinite.
+    #[error("{0} is not a finite number")]
+    NotFinite(f32),
+    /// Below zero.
+    #[error("{0} is negative")]
+    Negative(f32),
+    /// Above the device's limit for this command.
+    #[error("{value} is above the maximum {max}")]
+    AboveMax { value: f32, max: f32 },
+}
+
+fn check_value(value: f32, max: f32) -> Result<f32, InvalidValue> {
+    if !value.is_finite() {
+        Err(InvalidValue::NotFinite(value))
+    } else if value < 0.0 {
+        Err(InvalidValue::Negative(value))
+    } else if value > max {
+        Err(InvalidValue::AboveMax { value, max })
+    } else {
+        Ok(value)
+    }
+}
+
+fn f32_cmd(prefix: &[u8; 5], value: f32) -> Vec<u8> {
     let mut v = Vec::with_capacity(10);
-    v.extend_from_slice(&CMD_SETPOINT_PREFIX);
+    v.extend_from_slice(prefix);
     v.extend_from_slice(&value.to_le_bytes());
     v.push(checksum(&v));
     v
+}
+
+/// Highest setpoint of any mode: CR's 7500 Ω. The per-mode limits (CC 12 A, CV 60 V,
+/// CR 7500 Ω, CP 150 W) are the caller's to apply; this one only keeps absurd values off
+/// the wire.
+pub const SETPOINT_MAX: f32 = 7500.0;
+
+/// Build a "set setpoint" command (CC/CV/CR/CP), in the mode's unit.
+///
+/// Fails for NaN, infinity, a negative value or one above [`SETPOINT_MAX`].
+pub fn build_set_setpoint_cmd(value: f32) -> Result<Vec<u8>, InvalidValue> {
+    let value = check_value(value, SETPOINT_MAX)?;
+    Ok(f32_cmd(&CMD_SETPOINT_PREFIX, value))
 }
 
 /// Highest CAP discharge current the device accepts (12 A = 12000 mA).
@@ -417,14 +456,10 @@ pub const CAP_CURRENT_MAX_A: f32 = 12.0;
 
 /// Build a "set CAP discharge current" command (`0x05`), value in **Amps**.
 ///
-/// The value is clamped to the device's documented `0 – 12000 mA` range.
-pub fn build_set_cap_current_cmd(amps: f32) -> Vec<u8> {
-    let amps = amps.clamp(0.0, CAP_CURRENT_MAX_A);
-    let mut v = Vec::with_capacity(10);
-    v.extend_from_slice(&CMD_SET_CAP_CURRENT_PREFIX);
-    v.extend_from_slice(&amps.to_le_bytes());
-    v.push(checksum(&v));
-    v
+/// Fails for NaN, infinity, a negative value or one above [`CAP_CURRENT_MAX_A`].
+pub fn build_set_cap_current_cmd(amps: f32) -> Result<Vec<u8>, InvalidValue> {
+    let amps = check_value(amps, CAP_CURRENT_MAX_A)?;
+    Ok(f32_cmd(&CMD_SET_CAP_CURRENT_PREFIX, amps))
 }
 
 /// Parse a CAP discharge-current response (`DF 07 03 0A 04 <f32 LE> <csum>`).
@@ -512,7 +547,7 @@ mod tests {
 
     #[test]
     fn build_setpoint_cmd_layout() {
-        let cmd = build_set_setpoint_cmd(2.5);
+        let cmd = build_set_setpoint_cmd(2.5).unwrap();
         assert_eq!(&cmd[..5], &CMD_SETPOINT_PREFIX);
         assert_eq!(cmd.len(), 10);
         let f = f32::from_le_bytes([cmd[5], cmd[6], cmd[7], cmd[8]]);
@@ -526,22 +561,41 @@ mod tests {
     #[test]
     fn build_set_cap_current_matches_device_accepted_frame() {
         assert_eq!(
-            build_set_cap_current_cmd(5.0),
+            build_set_cap_current_cmd(5.0).unwrap(),
             vec![0xAF, 0x07, 0x03, 0x05, 0x04, 0x00, 0x00, 0xA0, 0x40, 0x5E]
         );
         assert_eq!(
-            build_set_cap_current_cmd(3.3),
+            build_set_cap_current_cmd(3.3).unwrap(),
             vec![0xAF, 0x07, 0x03, 0x05, 0x04, 0x33, 0x33, 0x53, 0x40, 0x45]
         );
     }
 
     #[test]
-    fn cap_current_is_clamped_to_device_range() {
-        let hi = build_set_cap_current_cmd(99.0);
+    fn cap_current_outside_device_range_is_rejected() {
+        assert_eq!(
+            build_set_cap_current_cmd(99.0),
+            Err(InvalidValue::AboveMax { value: 99.0, max: CAP_CURRENT_MAX_A })
+        );
+        assert_eq!(build_set_cap_current_cmd(-1.0), Err(InvalidValue::Negative(-1.0)));
+        assert!(matches!(build_set_cap_current_cmd(f32::NAN), Err(InvalidValue::NotFinite(_))));
+        // The limits themselves are accepted.
+        let hi = build_set_cap_current_cmd(CAP_CURRENT_MAX_A).unwrap();
         assert_eq!(f32::from_le_bytes([hi[5], hi[6], hi[7], hi[8]]), CAP_CURRENT_MAX_A);
-        let lo = build_set_cap_current_cmd(-1.0);
-        assert_eq!(f32::from_le_bytes([lo[5], lo[6], lo[7], lo[8]]), 0.0);
         assert!(checksum_ok(&hi));
+        assert!(build_set_cap_current_cmd(0.0).is_ok());
+    }
+
+    #[test]
+    fn setpoint_rejects_values_that_are_not_numbers() {
+        assert!(matches!(build_set_setpoint_cmd(f32::NAN), Err(InvalidValue::NotFinite(_))));
+        assert_eq!(
+            build_set_setpoint_cmd(f32::INFINITY),
+            Err(InvalidValue::NotFinite(f32::INFINITY))
+        );
+        assert_eq!(build_set_setpoint_cmd(-0.5), Err(InvalidValue::Negative(-0.5)));
+        assert!(build_set_setpoint_cmd(SETPOINT_MAX + 1.0).is_err());
+        assert!(build_set_setpoint_cmd(SETPOINT_MAX).is_ok());
+        assert!(build_set_setpoint_cmd(0.0).is_ok());
     }
 
     #[test]
@@ -581,7 +635,7 @@ mod tests {
 
     #[test]
     fn build_setpoint_10_matches_hci() {
-        let cmd = build_set_setpoint_cmd(10.0);
+        let cmd = build_set_setpoint_cmd(10.0).unwrap();
         assert_eq!(cmd, vec![0xAF, 0x07, 0x03, 0x04, 0x04, 0x00, 0x00, 0x20, 0x41, 0xDE]);
     }
 

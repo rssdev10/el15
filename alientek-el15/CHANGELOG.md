@@ -54,3 +54,7 @@ Compared with `el15-bt` 0.1.4:
   mode switch 4 times out of 6; paced, 6 out of 6 took effect.
 - `Device::connect` only uses characteristics of the EL15 service `FFF0`, preferring `FFF1`.
   Before, it fell back to any writable or notifying characteristic of the peripheral.
+- `build_set_setpoint_cmd` and `build_set_cap_current_cmd` return
+  `Result<Vec<u8>, InvalidValue>` and refuse NaN, infinity and negative values. The CAP
+  current above `CAP_CURRENT_MAX_A` (12 A) is refused instead of clamped; a setpoint above
+  `SETPOINT_MAX` (7500, CR's limit) is refused. Before, NaN reached the wire (`clamp` keeps it).

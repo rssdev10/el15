@@ -317,13 +317,13 @@ async fn run_debug_shell(args: &Cli) -> Result<()> {
             }
             "set" | "s" => {
                 match arg.parse::<f32>() {
-                    Ok(v) => {
-                        let cmd_bytes = build_set_setpoint_cmd(v);
-                        match dev.send(&cmd_bytes).await {
+                    Ok(v) => match build_set_setpoint_cmd(v) {
+                        Ok(cmd_bytes) => match dev.send(&cmd_bytes).await {
                             Ok(()) => println!("  >> SETPOINT {v} sent ({:02x?})", cmd_bytes),
                             Err(e) => println!("  !! send failed: {e}"),
-                        }
-                    }
+                        },
+                        Err(e) => println!("  !! invalid setpoint: {e}"),
+                    },
                     Err(_) => println!("  !! invalid float: {arg}"),
                 }
             }

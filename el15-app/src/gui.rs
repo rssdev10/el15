@@ -476,8 +476,8 @@ impl AppState {
                             if let Some(dev) = self.device.clone() {
                                 info!("retrying mode switch to {:?} (elapsed {}ms)", target, secs);
                                 let mut frames = vec![build_mode_cmd(target.to_proto())];
-                                if let Some(sp) = stored_setpoint(&self.settings, target) {
-                                    frames.push(build_set_setpoint_cmd(sp));
+                                if let Some(f) = stored_setpoint(&self.settings, target).and_then(setpoint_frame) {
+                                    frames.push(f);
                                 }
                                 self.pause_poll_ticks = self.pause_ticks_for(frames.len());
                                 return Task::perform(
@@ -667,7 +667,8 @@ impl AppState {
                     // commands.  Without this the load button appears to do nothing
                     // after a reconnect until the user manually clicks a mode button.
                     let mode = self.settings.last_mode.to_proto();
-                    let setpoint = stored_setpoint(&self.settings, self.settings.last_mode);
+                    let setpoint = stored_setpoint(&self.settings, self.settings.last_mode)
+                        .and_then(setpoint_frame);
                     return Task::perform(
                         async move {
                             let _ = d.init_handshake().await;
@@ -677,8 +678,8 @@ impl AppState {
                             // application-level commands.
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             let _ = d.send(&build_mode_cmd(mode)).await;
-                            if let Some(sp) = setpoint {
-                                let _ = d.send(&build_set_setpoint_cmd(sp)).await;
+                            if let Some(frame) = setpoint {
+                                let _ = d.send(&frame).await;
                             }
                             Message::Noop
                         },
@@ -829,8 +830,8 @@ impl AppState {
                     self.pause_poll_ticks = 3;
                     let mut frames = vec![build_mode_cmd(mk.to_proto())];
                     // Also send the stored setpoint so device uses our value.
-                    if let Some(sp) = stored_setpoint(&self.settings, mk) {
-                        frames.push(build_set_setpoint_cmd(sp));
+                    if let Some(f) = stored_setpoint(&self.settings, mk).and_then(setpoint_frame) {
+                        frames.push(f);
                     }
                     // CAP's discharge current never appears in the status
                     // packet, so it must be requested explicitly to be shown.
@@ -870,10 +871,10 @@ impl AppState {
                 info!("apply setpoint {} for mode {:?}", value, mode);
                 store_setpoint(&mut self.settings, mode, value);
                 let _ = settings::save(&self.settings);
-                if let Some(dev) = self.device.clone() {
+                if let (Some(dev), Some(frame)) = (self.device.clone(), setpoint_frame(value)) {
                     return Task::perform(
                         async move {
-                            let _ = dev.send(&build_set_setpoint_cmd(value)).await;
+                            let _ = dev.send(&frame).await;
                             Message::Noop
                         },
                         |m| m,
@@ -905,8 +906,8 @@ impl AppState {
                                     }
                                     Err(_) => stored_setpoint(&self.settings, mode),
                                 };
-                                if let Some(sp) = sp {
-                                    frames.push(build_set_setpoint_cmd(sp));
+                                if let Some(f) = sp.and_then(setpoint_frame) {
+                                    frames.push(f);
                                 }
                             }
                             // CAP has its own opcode. Sending the ordinary
@@ -915,8 +916,8 @@ impl AppState {
                             // wasting a slot in the burst and costing the load
                             // command its turn.
                             ModeKind::CAP => {
-                                if let Ok(a) = self.settings.cap.current_input.parse::<f32>() {
-                                    frames.push(build_set_cap_current_cmd(a));
+                                if let Some(f) = self.settings.cap.current_input.parse::<f32>().ok().and_then(cap_current_frame) {
+                                    frames.push(f);
                                 }
                             }
                             // DCR takes its parameters from the front panel.
@@ -1236,15 +1237,16 @@ impl AppState {
                     return Task::none();
                 };
                 let amps = amps.clamp(0.0, CAP_CURRENT_MAX_A);
+                // NaN survives the clamp; the builder refuses it.
+                let Some(cap_frame) = cap_current_frame(amps) else {
+                    return Task::none();
+                };
                 self.settings.cap.current_input = format!("{amps:.3}");
                 let _ = settings::save(&self.settings);
                 if let Some(dev) = self.device.clone() {
                     // Write, then read straight back: the device quantises to
                     // milliamps, so the stored value is the truth.
-                    let frames = vec![
-                        build_set_cap_current_cmd(amps),
-                        CMD_GET_CAP_CURRENT.to_vec(),
-                    ];
+                    let frames = vec![cap_frame, CMD_GET_CAP_CURRENT.to_vec()];
                     self.pause_poll_ticks = self.pause_ticks_for(frames.len());
                     return Task::perform(
                         async move {
@@ -1314,10 +1316,10 @@ impl AppState {
                 let value = clamp_setpoint(mode, value);
                 store_setpoint(&mut self.settings, mode, value);
                 let _ = settings::save(&self.settings);
-                if let Some(dev) = self.device.clone() {
+                if let (Some(dev), Some(frame)) = (self.device.clone(), setpoint_frame(value)) {
                     return Task::perform(
                         async move {
-                            let _ = dev.send(&build_set_setpoint_cmd(value)).await;
+                            let _ = dev.send(&frame).await;
                             Message::Noop
                         },
                         |m| m,
@@ -2724,6 +2726,20 @@ fn store_setpoint(s: &mut Settings, mode: ModeKind, value: f32) {
     }
 }
 
+/// The setpoint frame, or `None` (logged) for a value the device must not get.
+fn setpoint_frame(value: f32) -> Option<Vec<u8>> {
+    build_set_setpoint_cmd(value)
+        .map_err(|e| warn!("not sending setpoint: {e}"))
+        .ok()
+}
+
+/// The CAP discharge-current frame, or `None` (logged) for a value the device must not get.
+fn cap_current_frame(amps: f32) -> Option<Vec<u8>> {
+    build_set_cap_current_cmd(amps)
+        .map_err(|e| warn!("not sending CAP current: {e}"))
+        .ok()
+}
+
 fn clamp_setpoint(mode: ModeKind, v: f32) -> f32 {
     let (lo, hi) = setpoint_range(mode);
     v.max(lo).min(hi)
@@ -3241,9 +3257,9 @@ mod tests {
         assert!(stored_setpoint(&settings, ModeKind::DCR).is_none());
 
         // The CAP parameter frame must be the 0x05 opcode, not 0x04.
-        let cap_frame = build_set_cap_current_cmd(5.0);
+        let cap_frame = build_set_cap_current_cmd(5.0).unwrap();
         assert_eq!(cap_frame[3], 0x05);
-        let setpoint_frame = build_set_setpoint_cmd(5.0);
+        let setpoint_frame = build_set_setpoint_cmd(5.0).unwrap();
         assert_eq!(setpoint_frame[3], 0x04);
         assert_ne!(cap_frame, setpoint_frame);
     }

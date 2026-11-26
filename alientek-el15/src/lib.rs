@@ -27,10 +27,10 @@ pub mod error;
 #[cfg(feature = "ble")]
 pub use error::{Error, Result};
 pub use protocol::{
-    Status, Mode, Warning, FirmwareVersion, ParseError,
+    Status, Mode, Warning, FirmwareVersion, ParseError, InvalidValue,
     STATUS_HEADER, STATUS_LEN, CAP_CURRENT_HEADER, POLL_PKT,
     CMD_LOAD_ON, CMD_LOAD_OFF, CMD_LOCK, CMD_INIT, CMD_INFO, CMD_GET_CAP_CURRENT,
-    CAP_CURRENT_MAX_A, FAN_SPEED_MAX,
+    CAP_CURRENT_MAX_A, SETPOINT_MAX, FAN_SPEED_MAX,
     build_set_setpoint_cmd, build_set_cap_current_cmd, build_mode_cmd,
     parse_status_packet, parse_cap_current, checksum,
     parse_firmware_version, INTER_COMMAND_GAP,

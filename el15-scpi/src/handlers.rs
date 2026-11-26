@@ -168,6 +168,14 @@ async fn handle_setpoint(state: &SharedState, mode: Mode, args: &str, is_query: 
     }
 
     let value: f32 = args.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    // NaN, infinity or a negative value never reaches the device (or the stored state).
+    let frame = match build_set_setpoint_cmd(value) {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::warn!("SCPI setpoint rejected: {e}");
+            return None;
+        }
+    };
     state.set_setpoint(mode, value).await;
     if let Some(d) = state.snapshot().await.device {
         // Make sure we are in the right mode first, then send setpoint.
@@ -175,7 +183,7 @@ async fn handle_setpoint(state: &SharedState, mode: Mode, args: &str, is_query: 
             let _ = d.send(&build_mode_cmd(mode)).await;
             state.set_mode(mode).await;
         }
-        let _ = d.send(&build_set_setpoint_cmd(value)).await;
+        let _ = d.send(&frame).await;
     }
     None
 }

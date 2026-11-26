@@ -50,8 +50,10 @@ uses it. That has **no flow control**: commands written back-to-back are
 silently dropped, with no error reported to the host.
 
 Leave at least **120 ms** between consecutive commands
-(`alientek_el15::INTER_COMMAND_GAP`). Use `Device::send_sequence()` for any burst
-rather than consecutive `send()` calls.
+(`alientek_el15::INTER_COMMAND_GAP`). Since `alientek-el15` 0.1.0, `Device::send`
+enforces this itself: it waits until 120 ms have passed since the previous write
+from any task, so `send()`, `send_sequence()` and `init_handshake()` are all paced.
+A client that writes frames over its own link must do the same.
 
 Measured on HW:2.0 / SW:1.7 — three commands (set mode, set setpoint, set CAP
 current) sent with no gap:
@@ -70,6 +72,26 @@ like a UI that needs several button presses before a command "takes".
 
 The poll timer must also be held off for the duration of a burst, otherwise the
 periodic poll becomes one more back-to-back write (`AppState::pause_ticks_for`).
+With the library pacing every write the poll can no longer be dropped, but it
+still delays the burst by one gap.
+
+Re-measured on HW:2.0 / SW:1.7 (macOS, load off), 6 trials per row:
+
+| Sequence                                     | Gap    | Commands that took effect          | ACKs received |
+| -------------------------------------------- | ------ | ---------------------------------- | ------------- |
+| set mode CAP, set setpoint, set CAP current  | 0 ms   | mode 2/6, CAP current 6/6          | 9/18          |
+|                                              | 30 ms  | mode 5/6, CAP current 6/6          | 12/18         |
+|                                              | 60 ms  | mode 6/6, CAP current 6/6          | 13/18         |
+|                                              | 120 ms | mode 6/6, CAP current 6/6          | 18/18         |
+| same, through the library's paced `send()`   | (≈125 ms) | mode 6/6, CAP current 6/6       | 18/18         |
+| set mode CC↔CV, set CAP current              | 0–120 ms | 6/6 at every gap                 | all           |
+| poll, read CAP current (read-only)           | 0–120 ms | 20/20 at every gap               | —             |
+| init, info (`init_handshake`)                | 0–120 ms | 15/15 at every gap               | —             |
+
+Losses need three writes in a row; read-only queries were never lost. ACKs go
+missing even when every command took effect (60 ms row), so a missing ACK proves
+nothing — confirm with a readback. Over 300 paced polls every status packet
+arrived as one 28-byte notification with a valid checksum.
 
 ## Connection Handshake
 
@@ -320,11 +342,14 @@ Acknowledgement status byte (`DF 07 03 <cmd> 01 <status>`):
   Commands go to handle `0x0009`, notifications arrive on `0x0006`. A 28-byte
   status notification fragments as 20+8 on Android, and the 8-byte tail can
   begin with `AF` by coincidence, which looks exactly like a command.
-- **Characteristics:** the official Android app writes to `FFF3` and subscribes
-  to `FFF2`. This client uses `FFF1` for both, which the device also accepts —
-  `Device::connect` picks the first writable/notifying characteristic on the
-  `FFF0` service rather than a fixed UUID. No command has been found that works
-  on one characteristic but not the other.
+- **Characteristics:** the device exposes, under service `FFF0`, `FFF1`
+  (write without response + notify), `FFF2` (read + notify) and `FFF3` (write
+  without response). The official Android app writes to `FFF3` and subscribes to
+  `FFF2`. This client uses `FFF1` for both, which the device also accepts.
+  `Device::connect` prefers `FFF1`, falls back to another characteristic of the
+  `FFF0` service with the needed property, and never uses a characteristic of
+  another service (it fails with `CharacteristicNotFound`). No command has been
+  found that works on one characteristic but not the other.
 - **DCR mode** auto-stops after measurement completes. The `dcr_ohm` field
   reports resistance in **Ohms** (bytes 23..27, f32).
 - **Android BLE MTU:** On Android, 28-byte status notifications may arrive

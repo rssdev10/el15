@@ -13,8 +13,8 @@ First release under this name. Earlier versions lived in the app repository as `
 - Command frames and the checksum: init, info, poll, load on/off, lock, set mode, set setpoint,
   set and read the CAP discharge current.
 - Parsers for the status notification, the firmware version and the CAP discharge current.
-- Scanning, connecting, and a `Device` handle that sends commands (paced by
-  `INTER_COMMAND_GAP` in `send_sequence`) and turns notifications into `DeviceEvent`s.
+- Scanning, connecting, and a `Device` handle that sends commands, paced
+  `INTER_COMMAND_GAP` apart, and turns notifications into `DeviceEvent`s.
 
 Compared with `el15-bt` 0.1.4:
 
@@ -46,3 +46,9 @@ Compared with `el15-bt` 0.1.4:
   async runtime and depends only on `thiserror`. `INTER_COMMAND_GAP` moved to `protocol` and
   is available either way.
 - `serde` is no longer a default feature.
+- `Device::send` keeps `INTER_COMMAND_GAP` (120 ms) since the previous write from any task,
+  and writes never overlap. Before, only `send_sequence` paced, and `init_handshake` sent its
+  two frames back-to-back. Measured on the device: a 3-command burst without pacing lost the
+  mode switch 4 times out of 6; paced, 6 out of 6 took effect.
+- `Device::connect` only uses characteristics of the EL15 service `FFF0`, preferring `FFF1`.
+  Before, it fell back to any writable or notifying characteristic of the peripheral.

@@ -66,14 +66,14 @@ pub const CAP_CURRENT_HEADER: [u8; 5] = [0xDF, 0x07, 0x03, 0x0A, 0x04];
 /// (feature `ble`) uses it — and that has no flow control: frames written
 /// back-to-back are silently dropped, with no error on this side.
 ///
-/// Measured on HW:2.0 / SW:1.7. Three commands sent with no gap (set mode, set
-/// setpoint, set CAP current) landed **none** of the trailing two — the CAP
-/// current read back unchanged three times running, and one reply came back
-/// corrupted (`df 01 04 39 …`, containing bytes of the outgoing frame). The
-/// same three spaced 120 ms apart took effect 3 times out of 3.
+/// Measured on HW:2.0 / SW:1.7: three commands sent with no gap (set mode CAP,
+/// set setpoint, set CAP current) lost the mode switch 4 times out of 6, and
+/// earlier one reply came back corrupted (`df 01 04 39 …`, containing bytes of
+/// the outgoing frame). The same three 120 ms apart took effect 6 times out of 6.
+/// Read-only queries were never lost. See `docs/BT_PROTOCOL.md`.
 ///
 /// This is why a burst of commands used to need several button presses before
-/// one "took".
+/// one "took". With the `ble` feature, `Device::send` keeps this gap itself.
 pub const INTER_COMMAND_GAP: Duration = Duration::from_millis(120);
 
 /// Compute the checksum byte that makes `sum(packet) % 256 == 0`.

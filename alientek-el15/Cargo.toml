@@ -15,7 +15,8 @@ include = ["src/**/*.rs", "examples/**/*.rs", "Cargo.toml", "README.md", "CHANGE
 
 [dependencies]
 btleplug.workspace = true
-tokio.workspace = true
+# Only what the library uses; applications bring their own runtime.
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 tokio-stream.workspace = true
 futures.workspace = true
 uuid.workspace = true
@@ -26,6 +27,9 @@ serde = { workspace = true, optional = true }
 [features]
 default = ["serde"]
 serde = ["dep:serde"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [[example]]
 name = "status"

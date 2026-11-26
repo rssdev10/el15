@@ -20,3 +20,5 @@ Compared with `el15-bt` 0.1.4:
 
 - Renamed: the crate `el15-bt` is now `alientek-el15` (`use alientek_el15::...`); the tracing
   target is `alientek_el15`.
+- It requires only tokio's `rt`, `sync` and `time` features; applications bring their own
+  runtime (`Device::connect` spawns a task, so it must run inside one).

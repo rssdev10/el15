@@ -250,8 +250,8 @@ pub struct Status {
     /// Capacity discharged in CAP mode, Ah.
     pub capacity_ah: f32,
 
-    /// Internal resistance measured in DCR mode, Ω.
-    pub dcr_ohm: f32,
+    /// Internal resistance measured in DCR mode, **mΩ** (milliohms).
+    pub dcr_mohm: f32,
     /// First DCR test current, A (set on the front panel).
     pub dcr_i1: f32,
     /// Second DCR test current, A (set on the front panel).
@@ -367,7 +367,7 @@ pub fn parse_status_packet(data: &[u8]) -> Result<Status, ParseError> {
         Some(Mode::DCR) => {
             s.dcr_i1 = read_f32_le(&data[15..19]);
             s.dcr_i2 = read_f32_le(&data[19..23]);
-            s.dcr_ohm = read_f32_le(&data[23..27]);
+            s.dcr_mohm = read_f32_le(&data[23..27]);
             s.runtime_s = 0;
             // Voltage/current/power from bytes 7–15 reflect the live
             // measurement during the DCR test.
@@ -612,6 +612,30 @@ mod tests {
         assert!((s.setpoint - 0.3).abs() < 0.01);
         assert!((s.temperature - 22.0).abs() < 1.0);
         assert_eq!(s.warning, None);
+    }
+
+    /// DCR result from the real device (HW:2.0 / SW:1.7) on a Li-ion cell, right after
+    /// the test stopped: I1 = 25 mA, I2 = 1000 mA, R = 173.15 mΩ. The voltage drop between
+    /// the two test currents (4.1693 V at 0.0248 A, 3.9998 V at 1.0013 A) gives 173.6 mΩ,
+    /// which is how the field is known to be in milliohms, not Ohms.
+    #[test]
+    fn parse_dcr_status_from_device() {
+        let mut data = hex_to_bytes(
+            "df07030816\
+             0a006571854000000000cdcccc3c0000803fcc252d43\
+             00",
+        );
+        data.truncate(STATUS_LEN - 1);
+        data.push(checksum(&data));
+        let s = parse_status_packet(&data).expect("valid packet");
+        assert_eq!(s.mode(), Some(Mode::DCR));
+        assert!(!s.load_on);
+        assert!((s.voltage - 4.1701).abs() < 1e-3);
+        assert!((s.dcr_i1 - 0.025).abs() < 1e-6);
+        assert!((s.dcr_i2 - 1.0).abs() < 1e-6);
+        assert!((s.dcr_mohm - 173.15).abs() < 0.01, "got {}", s.dcr_mohm);
+        assert_eq!(s.runtime_s, 0);
+        assert_eq!(s.temperature, 0.0, "DCR packets carry no temperature");
     }
 
     #[test]

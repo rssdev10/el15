@@ -215,7 +215,7 @@ Observed: `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
 | 11..15 | current    | f32  | Amps (CC/CV/CR/CP)                                                       |
 | 15..19 | runtime    | f32  | Seconds (or DCR I1 current in DCR mode)                                  |
 | 19..23 | varies     | f32  | Temperature (°C) for CC/CV/CR/CP, energy (Wh×1000) for CAP, DCR I2       |
-| 23..27 | varies     | f32  | Setpoint for CC/CV/CR/CP, capacity (Ah×1000) for CAP, DCR resistance (Ω) |
+| 23..27 | varies     | f32  | Setpoint for CC/CV/CR/CP, capacity (Ah×1000) for CAP, DCR resistance (mΩ) |
 | 27     | checksum   | u8   | Sum of all 28 bytes ≡ 0 (mod 256)                                        |
 
 ### Mode-specific field interpretation
@@ -224,7 +224,7 @@ Observed: `DF 07 03 07 0A 45 4C 31 35 00 00 00 00 00 00 0F`
 | ------- | ---------------- | ----------------- | ------------------ |
 | CC/CV/CR/CP | runtime (s)  | temperature (°C)  | setpoint (mode unit)|
 | CAP     | runtime (s)      | energy (Wh×1000)  | capacity (Ah×1000) |
-| DCR     | I1 current (A)   | I2 current (A)    | resistance (Ω)    |
+| DCR     | I1 current (A)   | I2 current (A)    | resistance (mΩ)   |
 
 ### Warning codes (byte6 high nibble when bit1+bit2 of byte5 are set)
 
@@ -350,8 +350,11 @@ Acknowledgement status byte (`DF 07 03 <cmd> 01 <status>`):
   `FFF0` service with the needed property, and never uses a characteristic of
   another service (it fails with `CharacteristicNotFound`). No command has been
   found that works on one characteristic but not the other.
-- **DCR mode** auto-stops after measurement completes. The `dcr_ohm` field
-  reports resistance in **Ohms** (bytes 23..27, f32).
+- **DCR mode** auto-stops after measurement completes. The `dcr_mohm` field
+  (bytes 23..27, f32) reports resistance in **milliohms**. Measured on a Li-ion
+  cell with I1 = 25 mA and I2 = 1000 mA: 4.1693 V at 0.0248 A and 3.9998 V at
+  1.0013 A give ΔV/ΔI = 0.1736 Ω = 173.6 mΩ; the device reported `173.15`.
+  The field keeps the previous result until a test completes.
 - **Android BLE MTU:** On Android, 28-byte status notifications may arrive
   fragmented as 20+8 byte chunks. On macOS, they arrive as a single 28-byte
   notification.

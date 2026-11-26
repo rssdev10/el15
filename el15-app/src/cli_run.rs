@@ -202,7 +202,7 @@ async fn run_debug_shell(args: &Cli) -> Result<()> {
             match ev {
                 DeviceEvent::Status(s) => {
                     let extra = if s.mode_byte == 0x0A {
-                        format!(" DCR: I1={:.1}mA I2={:.1}mA R={:.1}Ω", s.dcr_i1 * 1000.0, s.dcr_i2 * 1000.0, s.dcr_ohm)
+                        format!(" DCR: I1={:.1}mA I2={:.1}mA R={:.1}mΩ", s.dcr_i1 * 1000.0, s.dcr_i2 * 1000.0, s.dcr_mohm)
                     } else if s.mode_byte == 0x02 {
                         format!(" CAP: {:.3}Ah {:.3}Wh", s.capacity_ah, s.energy_wh)
                     } else {

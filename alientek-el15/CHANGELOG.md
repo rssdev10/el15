@@ -23,7 +23,9 @@ Compared with `el15-bt` 0.1.4:
 - It requires only tokio's `rt`, `sync` and `time` features; applications bring their own
   runtime (`Device::connect` spawns a task, so it must run inside one).
 - Renamed: `EL15Status` is now `Status`, `EL15_SERVICE_UUID` is `SERVICE_UUID`, `HEADER` is
-  `STATUS_HEADER`; `Status::dcr_mohm` is `dcr_ohm` (it always held Ohms).
+  `STATUS_HEADER`.
+- `Status::dcr_mohm` is documented as milliohms. Measured on a cell (173.6 mΩ from the
+  voltage drop between the two test currents, 173.15 reported); earlier notes said Ohms.
 - `parse_status_packet` returns `Result<Status, ParseError>` and rejects a wrong length,
   header or **checksum**. Before, a corrupted packet came back with `crc_pass: false` but
   `valid: true`, and `Device` emitted it as a measurement. `DeviceEvent::Status` now only

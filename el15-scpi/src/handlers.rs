@@ -146,12 +146,17 @@ async fn handle(state: &SharedState, head: &str, args: &str, is_query: bool) -> 
 
         // -------- DCR mode measurement --------
         "MEAS:DCR" | "MEASURE:DCR" if is_query => {
-            Some(format!("{:.6}", state.snapshot().await.status.dcr_mohm))
+            Some(format!("{:.6}", dcr_ohms(&state.snapshot().await.status)))
         }
 
         _ if is_query => Some("-113,\"Undefined header\"".to_string()),
         _ => None,
     }
+}
+
+/// The last DCR result in Ohms, the SCPI base unit; the device reports milliohms.
+fn dcr_ohms(status: &alientek_el15::Status) -> f32 {
+    status.dcr_mohm / 1000.0
 }
 
 async fn handle_setpoint(state: &SharedState, mode: Mode, args: &str, is_query: bool) -> Option<String> {
@@ -221,5 +226,17 @@ fn scpi_func(mode: Mode) -> &'static str {
         Mode::CAP => "CAP",
         Mode::DCR => "DCR",
         _ => "CURR",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dcr_is_reported_in_ohms() {
+        // 173.15 mΩ, as the device reported for a Li-ion cell.
+        let status = alientek_el15::Status { dcr_mohm: 173.15, ..Default::default() };
+        assert!((dcr_ohms(&status) - 0.17315).abs() < 1e-6);
     }
 }
